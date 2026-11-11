@@ -1,46 +1,18 @@
-# Copyright (C) 2023 Maciej Delmanowski <drybjed@gmail.com>
-# Copyright (C) 2023 DebOps <https://debops.org/>
+# Copyright (C) 2023-2026 Maciej Delmanowski <drybjed@gmail.com>
+# Copyright (C) 2023-2026 DebOps <https://debops.org/>
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-from .utils import unexpanduser
-from .ansibleconfig import AnsibleConfig
-from .ansible.inventory import AnsibleInventory
+from .projectrunner import ProjectRunner
+from .hooks import run_hooks
 import subprocess
-import configparser
-import textwrap
 import os
-import sys
 
 
-class EnvRunner(object):
+class EnvRunner(ProjectRunner):
+    """Run a command in the DebOps project environment."""
 
-    def __init__(self, project, *args, **kwargs):
-        self.args = args
-        self.kwargs = kwargs
-
-        self.project = project
-        self.inventory = AnsibleInventory(project, name=project.view)
-
-        try:
-            self._inventory_paths = (
-                    project.ansible_cfg.get_option('inventory').split(','))
-        except configparser.NoSectionError:
-            path = project.ansible_cfg.path
-            if (os.path.exists(path) and os.path.isfile(path)):
-                raise ValueError("Cannot find [defaults] section in " + path)
-            else:
-                raise FileNotFoundError("Cannot find Ansible "
-                                        "configuration file at " + path)
-        except configparser.NoOptionError:
-            errmsg = ('Error: No inventory specified in the "ansible.cfg" '
-                      'configuration file. You might want to run '
-                      '"debops project refresh" command to ensure that it\'s '
-                      'included in the generated file. If this is a legacy '
-                      'project, check if the "inventory" option is present '
-                      'in the ".debops.cfg" file. The default is:')
-            print(textwrap.fill(errmsg, 78))
-            print('\n    [ansible defaults]\n    inventory = ansible/inventory')
-            sys.exit(1)
+    def __init__(self, project, **kwargs):
+        super().__init__(project, **kwargs)
 
         self._command = self.kwargs['command_args']
 
@@ -57,13 +29,19 @@ class EnvRunner(object):
 
         for key, value in self.project.config._env_vars.items():
             os.environ[key] = value
+
+        if not run_hooks(self.project.path, 'pre-env'):
+            raise ChildProcessError('Hook pre-env aborted, '
+                                    'not running command in environment')
+
+        rc = 0
         try:
             unlocked = self.inventory.unlock()
 
             executor = subprocess.Popen(' '.join(self._command),
                                         shell=True)
             std_out, std_err = executor.communicate()
-            return executor.returncode
+            rc = executor.returncode
 
         except KeyboardInterrupt:
             if unlocked:
@@ -73,3 +51,8 @@ class EnvRunner(object):
         finally:
             if unlocked:
                 self.inventory.lock()
+
+        run_hooks(self.project.path, 'post-env',
+                  extra_env={'DEBOPS_RETURN_CODE': rc})
+
+        return rc

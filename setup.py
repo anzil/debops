@@ -14,6 +14,7 @@ import subprocess
 import glob
 import os
 import re
+import sys
 
 
 def find_files(directory, strip):
@@ -80,6 +81,14 @@ with open('src/debops/__version__.py', 'w') as version_file:
     version_file.write('__version__ = "{}"\n'
                        .format(RELEASE))
 
+# Stamp the rest of the generated version files (the bundled collection
+# manifest, which carries the SemVer form) via the standalone script;
+# it lives in the repository but might not in a build context
+STAMP_VERSION = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'lib', 'ansible-galaxy', 'stamp-version')
+if os.path.exists(STAMP_VERSION):
+    subprocess.call([sys.executable, STAMP_VERSION])
+
 MANPAGES_1 = []
 MANPAGES_5 = []
 if os.path.exists('docs/_build/man'):
@@ -97,11 +106,13 @@ setup(
                       'pyxdg', 'toml', 'python-dotenv', 'gitpython'],
     extras_require={
         'ansible': ['ansible', 'netaddr', 'passlib',
-                    'python-ldap', 'dnspython', 'pyopenssl']
+                    'python-ldap', 'dnspython', 'pyopenssl'],
+        'tests': ['pytest>=7', 'pytest-cov']
     },
     package_dir={'': 'src'},
-    packages=find_packages('src', exclude=('tests', 'docs')),
+    packages=find_packages('src', exclude=('tests', 'tests.*', 'docs')),
     data_files=[
+        ('share/doc/debops', ['CREDITS'] if os.path.exists('CREDITS') else []),
         ('share/man/man1', MANPAGES_1),
         ('share/man/man5', MANPAGES_5),
     ],
@@ -131,7 +142,7 @@ setup(
     license="GPL-3.0-or-later",
     license_files=glob.glob("LICENSES/*.txt"),
     keywords="ansible debian sysadmin",
-    python_requires='<4',
+    python_requires='>=3.8,<4',
     download_url='https://github.com/debops/debops'
                  '/archive/v' + unicode(RELEASE) + '.tar.gz',
     classifiers=[
@@ -151,6 +162,8 @@ setup(
                 'Programming Language :: Python :: 3.11',
                 'Programming Language :: Python :: 3.12',
                 'Programming Language :: Python :: 3.13',
+                'Programming Language :: Python :: 3.14',
+                'Programming Language :: Python :: 3.15',
                 'Topic :: System :: Installation/Setup',
                 'Topic :: System :: Systems Administration',
                 'Topic :: Utilities'

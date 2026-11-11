@@ -87,10 +87,12 @@ infrastructure environments.
    user-guide/debops-for-ansible
    user-guide/project-directories
    user-guide/scripts/index
+   user-guide/hooks
    user-guide/global-variables
    user-guide/custom-environment
    user-guide/playbooks
    user-guide/universal-configuration
+   user-guide/inventory-spec
    user-guide/dns-configuration
    ansible/role-index
    ansible/roles/index
@@ -113,6 +115,7 @@ infrastructure environments.
    developer-guide/contribution-workflow
    developer-guide/contributing-docs
    developer-guide/testing
+   developer-guide/gh-ci-pipeline
    developer-guide/development-model
    dep/index
 
@@ -128,6 +131,7 @@ infrastructure environments.
    meta/timeline
    meta/references
    meta/logo
+   meta/credits
    meta/other-projects
    meta/debops-oid-registry
 

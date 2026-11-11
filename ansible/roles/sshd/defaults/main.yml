@@ -606,7 +606,7 @@ sshd__default_configuration:
                if (sshd__register_host_certs is defined and
                    "stdout_lines" in sshd__register_host_certs)
                else "ignore" }}'
-    copy_id_from: 'HostKey'
+    anchor_to: 'HostKey'
 
   # Add support for authorized keys managed by the
   # "debops.authorized_keys" Ansible role.
@@ -623,7 +623,7 @@ sshd__default_configuration:
     state: '{{ "present"
                if (sshd__trusted_user_ca_keys | d() | length > 0)
                else "ignore" }}'
-    copy_id_from: 'AuthorizedKeysFile'
+    anchor_to: 'AuthorizedKeysFile'
 
   # Default "Match" conditional block which defines configuration for SFTPonly
   # accounts. The 'stfponly' UNIX system group is created by the
@@ -646,26 +646,22 @@ sshd__default_configuration:
   # Specify if access to "root" UNIX account should be granted. By default, if
   # the 'debops.root_account' role has been applied on the host, the "root"
   # UNIX account can be accessed only using SSH public keys, since the role is
-  # expected to set them up. Otherwise, access via password is allowed.
+  # expected to set them up. Otherwise, access via password is denied.
   # Alternatively, configured sysadmin accounts via the 'debops.system_users'
-  # role disable password-based access.
+  # role disable password-based access and leave only SSH public keys.
   - name: 'PermitRootLogin'
     value: '{{ "prohibit-password"
                if (ansible_local.root_account.ssh_authorized_keys | d() | bool or
                    ansible_local.system_users.configured | d() | bool)
-               else True }}'
+               else False }}'
     state: 'present'
 
-  # Enable or disable password authentication. This option will be enabled if
-  # the 'root' account does not have SSH authorized keys present, to allow the
-  # 'root' account to login to the host. Alternatively, sysadmin access
-  # configured by the 'debops.system_users' role disables password
-  # authentication.
+  # Disable password authentication by default. This configuration assumes
+  # that a deployment infrastructure (cloud-init, bootstrap playbook,
+  # preseeding) has configured the ``root`` account or UNIX system user
+  # accounts with the SSH public keys.
   - name: 'PasswordAuthentication'
-    value: '{{ False
-               if (ansible_local.root_account.ssh_authorized_keys | d() | bool or
-                   ansible_local.system_users.configured | d() | bool)
-               else True }}'
+    value: False
     state: 'present'
 
   # Disable ChallengeResponseAuthentication by default. Otherwise, setting
@@ -691,6 +687,19 @@ sshd__default_configuration:
     value: True
     state: 'present'
 
+  # Disable SSH agent forwarding by default. It is not needed on all servers,
+  # and the ones it is useful for can enable it explicitly through the
+  # inventory.
+  - name: 'AllowAgentForwarding'
+    value: False
+    state: 'present'
+
+  # Disable X11 forwarding by default. It's not useful on headless servers, and
+  # can be explicitly enabled through the Ansible inventory when needed.
+  - name: 'X11Forwarding'
+    value: False
+    state: 'present'
+
   - name: 'Ciphers'
     comment: 'List of ciphers which are allowed for connections'
     raw: |
@@ -703,7 +712,7 @@ sshd__default_configuration:
       {{ 'Ciphers {}'.format(sshd__tpl_ciphers | join(",")) }}
       {% endif %}
     state: 'present'
-    copy_id_from: 'RekeyLimit'
+    anchor_to: 'RekeyLimit'
 
   - name: 'KexAlgorithms'
     comment: 'List of allowed key exchange algorithms'
@@ -719,7 +728,7 @@ sshd__default_configuration:
       {{ 'KexAlgorithms {}'.format(sshd__tpl_kex_algorithms | join(",")) }}
       {% endif %}
     state: 'present'
-    copy_id_from: 'RekeyLimit'
+    anchor_to: 'RekeyLimit'
 
   - name: 'MACs'
     comment: 'List of allowed Message Authentication Code algorithms'
@@ -733,25 +742,25 @@ sshd__default_configuration:
       {{ 'MACs {}'.format(sshd__tpl_macs | join(",")) }}
       {% endif %}
     state: 'present'
-    copy_id_from: 'RekeyLimit'
+    anchor_to: 'RekeyLimit'
 
     # Privilege Separation is default for sshd v7.5+
   - name: 'UsePrivilegeSeparation'
     comment: 'Privilege Separation is turned on for security'
     value: 'sandbox'
     state: '{{ "present" if (sshd__version is version("7.5", "<")) else "ignore" }}'
-    copy_id_from: 'RekeyLimit'
+    anchor_to: 'RekeyLimit'
 
   - name: 'KeyRegenerationInterval'
     comment: 'Lifetime and size of ephemeral version 1 server key'
     value: 3600
     state: '{{ "present" if (sshd__version is version("7.4", "<")) else "ignore" }}'
-    copy_id_from: 'RekeyLimit'
+    anchor_to: 'RekeyLimit'
 
   - name: 'ServerKeyBits'
     value: 1024
     state: '{{ "present" if (sshd__version is version("7.4", "<")) else "ignore" }}'
-    copy_id_from: 'RekeyLimit'
+    anchor_to: 'RekeyLimit'
 
   - name: 'AuthorizedKeysCommand'
     value: '/etc/ssh/authorized_keys_lookup'
@@ -964,7 +973,10 @@ sshd__authorized_keys_lookup_user: 'sshd'
 # .. envvar:: sshd__authorized_keys_lookup_type [[[
 #
 # List of lookup scripts that should be enabled on a host.
-sshd__authorized_keys_lookup_type: [ 'ldap', 'sss' ]
+sshd__authorized_keys_lookup_type: [ '{{ "sss"
+                                         if "debops_service_sssd" in group_names
+                                         else "ldap" }}' ]
+
                                                                    # ]]]
                                                                    # ]]]
 # LDAP lookup configuration [[[

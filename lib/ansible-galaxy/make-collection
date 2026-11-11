@@ -232,6 +232,7 @@ file_list=(
     README.md
     INSTALL.rst
     CHANGELOG.rst
+    CREDITS
 )
 
 directory_list=(
@@ -426,11 +427,21 @@ for collection in "${collections[@]}" ; do
     if [ -d "${workdir_map[${collection}]}" ] ; then
         pushd "${workdir_map[${collection}]}" > /dev/null
         ansible-galaxy collection build
-        python3 -m galaxy_importer.main debops-*.tar.gz
+        # Run the importer check with the Python that runs Ansible, so
+        # that 'galaxy_importer' is importable in the same environment
+        # as Ansible - for example a 'pipx' managed virtual environment
+        ansible_python="$(sed -e '1s|^#!||' -e 1q "$(command -v ansible-galaxy)")"
+        "${ansible_python}" -m galaxy_importer.main debops-*.tar.gz
         cp debops-*.tar.gz ../
         popd > /dev/null
     fi
 done
 
+# Copy the tarballs where the smoke test and the CI pipeline can find them
+collection_output="${DEBOPS_COLLECTION_OUTPUT:-${repository_root}/dist/collections}"
+mkdir -p "${collection_output}"
+cp "${workdir_path}"/*.tar.gz "${collection_output}/"
+
 # Show the file sizes of collection tarballs
 du -h "${workdir_path}"/*.tar.gz
+printf "Collection tarballs written to %s\\n" "${collection_output}"

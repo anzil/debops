@@ -15,6 +15,9 @@ The :command:`debops exec` command will automatically unlock and lock the
 encrypted :file:`ansible/secret/` directory as needed, to give the Ansible
 module access to secrets.
 
+This command executes :ref:`hook scripts <debops_hooks>` (``pre-exec`` and
+``post-exec``) before and after the Ansible module execution.
+
 Options
 ~~~~~~~
 
@@ -42,6 +45,10 @@ effect.
   Do not execute :command:`ansible` command; instead print out all the
   environment variables and the command itself to stdout.
 
+``--help-ansible``
+  Display the list of the :command:`ansible` options which the
+  :command:`debops exec` command recognizes directly and exit.
+
 ``-v, --verbose``
   Increase output verbosity. More letters means higher verbosity.
 
@@ -50,9 +57,12 @@ effect.
   this mark will be passed to the :command:`ansible` command as-is.
 
 ``[ansible_args]``
-  You can specify all arguments supported by the :command:`ansible` command to
-  augment the execution, for example ``--diff``, ``--check``, ``--become``, and
-  so on. See :command:`ansible --help` for more details.
+  A common subset of the :command:`ansible` options is recognized by DebOps
+  directly and can be specified before the Ansible arguments. Run
+  :command:`debops exec --help-ansible` for the list. Any other arguments
+  supported by the :command:`ansible` command must be specified after the
+  command arguments and are passed through unchanged. See
+  :command:`ansible --help` for its full option set.
 
 Examples
 ~~~~~~~~

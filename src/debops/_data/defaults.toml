@@ -12,6 +12,10 @@
 # By default it will rely on the system's $PATH.
 ansible = "{{ env['DEBOPS_CMD_ANSIBLE'] | d('ansible') }}"
 
+# Path to binary which will be used to execute 'ansible-inventory' command.
+# By default it will rely on the system's $PATH.
+ansible-inventory = "{{ env['DEBOPS_CMD_ANSIBLE_INVENTORY'] | d('ansible-inventory') }}"
+
 # Path to binary which will be used to execute 'ansible-galaxy' command.
 # By default it will rely on the system's $PATH.
 ansible-galaxy = "{{ env['DEBOPS_CMD_ANSIBLE_GALAXY'] | d('ansible-galaxy') }}"
@@ -49,6 +53,23 @@ fusermount = "{{ env['DEBOPS_CMD_FUSERMOUNT'] | d('fusermount') }}"
 # The default commit message used for new git repositories.
 init_message = "Initialize new DebOps project directory"
 
+[project.venv]
+
+# Enable an encapsulated Python virtual environment in the project directory,
+# managed by the 'debops project venv' command. Usually enabled at project
+# creation time with the 'debops project init --venv' command.
+enabled = false
+
+# Path to the Python virtual environment, relative to the project directory.
+path = ".debops/venv"
+
+# Path to the file with pinned Python package versions, relative to the
+# project directory.
+requirements = ".debops/requirements.txt"
+
+# Python interpreter used to create the virtual environment.
+python = "python3"
+
 [syslog]
 
 # Hostname or IP address of a syslog server where messages should be sent.
@@ -67,3 +88,34 @@ facility = "user"
 # at the command line increases log level. Supported levels are:
 # DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL
 level = "WARNING"
+
+[version_check]
+
+# Enable checking for new DebOps versions at startup. When enabled,
+# DebOps periodically checks a configured source and displays a notice
+# on stderr if an update is available. This option is opt-in only.
+enabled = false
+
+# How often to check for updates, in hours. The result is cached locally,
+# so network calls only happen once per interval.
+check_interval = 24
+
+# Timeout in seconds for network requests (PyPI) and git subprocess calls.
+timeout = 5
+
+# PyPI package name to query when installed via pip/pipx.
+pypi_package = "debops"
+
+# PyPI JSON API URL template. The {package} placeholder is replaced with
+# the value of pypi_package.
+pypi_url = "https://pypi.org/pypi/{package}/json"
+
+# Name of the git remote to fetch and compare against for git checkouts.
+git_remote = "origin"
+
+# Optional URL of the canonical DebOps git repository to check against.
+# When set, the check fetches from this URL directly instead of the
+# configured git_remote. Use this when the local 'origin' is a fork, or
+# for self-hosted mirrors. When empty, the git_remote name is used and
+# the user's existing git credentials and configuration are respected.
+git_repo_url = ""
