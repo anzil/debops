@@ -116,8 +116,8 @@ metrics_server = "{{ gitlab_runner__metrics_server }}"
   [runners.docker]
     image = "{{ runner.docker_image | d(gitlab_runner__docker_image) }}"
     privileged = {{ (runner.docker_privileged | d(gitlab_runner__docker_privileged)) | bool | lower }}
-{%       if runner.docker_services_privileged | d() %}
-    docker_services_privileged = "{{ runner.docker_services_privileged }}"
+{%      if runner.docker_services_privileged | d() %}
+    services_privileged = {{ runner.docker_services_privileged | bool | lower }}
 {%       endif %}
     disable_cache = {{ (runner.docker_disable_cache | d(gitlab_runner__docker_disable_cache)) | bool | lower }}
 {%       if (runner.docker_cache_dir | d() or gitlab_runner__docker_cache_dir) %}
