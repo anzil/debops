@@ -81,7 +81,7 @@ metrics_server = "{{ gitlab_runner__metrics_server }}"
   limit = {{ runner.limit }}
 {%     endif %}
 {%     if runner.request_concurrency | d() %}
-  limit = {{ runner.request_concurrency }}
+  request_concurrency = {{ runner.request_concurrency }}
 {%     endif %}
 {%     if runner.output_limit | d() %}
   output_limit = {{ runner.output_limit }}
