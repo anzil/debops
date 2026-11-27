@@ -1,0 +1,2354 @@
+# Copyright (C) 2026 Maciej Delmanowski <drybjed@gmail.com>
+# Copyright (C) 2026 DebOps <https://debops.org/>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""Tests for ``debops.core.config``."""
+
+import json
+import logging
+import os
+from unittest import mock
+
+import pytest
+import yaml
+
+from debops.core import config as config_module
+from debops.core.exceptions import OptionNotFoundError, OptionRefused
+from debops.core.utils import unexpanduser
+
+
+def test_expand_env_vars_expands_a_string(configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_TEST_VALUE", "hello")
+
+    assert configuration._expand_env_vars("$DEBOPS_TEST_VALUE") == "hello"
+
+
+def test_expand_env_vars_walks_a_dictionary(configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_TEST_VALUE", "hello")
+
+    assert configuration._expand_env_vars(
+        {"a": "$DEBOPS_TEST_VALUE"}) == {"a": "hello"}
+
+
+def test_expand_env_vars_walks_a_list(configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_TEST_VALUE", "hello")
+
+    assert configuration._expand_env_vars(
+        ["$DEBOPS_TEST_VALUE"]) == ["hello"]
+
+
+@pytest.mark.parametrize("value", [42, None, True])
+def test_expand_env_vars_leaves_other_types_alone(configuration, value):
+    assert configuration._expand_env_vars(value) == value
+
+
+def test_merge_dict_overwrites_a_scalar(configuration):
+    data = {"a": 1}
+
+    configuration._merge_dict(data, {"a": 2})
+
+    assert data == {"a": 2}
+
+
+def test_merge_dict_adds_missing_keys(configuration):
+    data = {"a": 1}
+
+    configuration._merge_dict(data, {"b": 2})
+
+    assert data == {"a": 1, "b": 2}
+
+
+def test_merge_dict_merges_nested_dictionaries(configuration):
+    data = {"a": {"b": 1, "c": 2}}
+
+    configuration._merge_dict(data, {"a": {"b": 9, "d": 3}})
+
+    assert data == {"a": {"b": 9, "c": 2, "d": 3}}
+
+
+def test_merge_dict_extends_lists(configuration):
+    data = {"a": [1, 2]}
+
+    configuration._merge_dict(data, {"a": [3]})
+
+    assert data == {"a": [1, 2, 3]}
+
+
+def test_merge_dict_deduplicates_list_entries(configuration):
+    data = {"a": [1, 2]}
+
+    configuration._merge_dict(data, {"a": [2, 3]})
+
+    assert data == {"a": [1, 2, 3]}
+
+
+def test_merge_dict_deduplicates_entries_within_a_source(configuration):
+    data = {"a": [1]}
+
+    configuration._merge_dict(data, {"a": [2, 2, 3]})
+
+    assert data == {"a": [1, 2, 3]}
+
+
+def test_merge_dict_replaces_on_a_type_mismatch(configuration):
+    data = {"a": [1]}
+
+    configuration._merge_dict(data, {"a": {"b": 1}})
+
+    assert data == {"a": {"b": 1}}
+
+
+@pytest.mark.parametrize("source", [None, {}])
+def test_merge_dict_ignores_an_empty_source(configuration, source):
+    data = {"a": 1}
+
+    configuration._merge_dict(data, source)
+
+    assert data == {"a": 1}
+
+
+def test_get_returns_the_whole_configuration_without_items(configuration):
+    configuration._config = {"a": 1}
+
+    assert configuration.get() == {"a": 1}
+
+
+def test_get_accepts_a_single_key(configuration):
+    configuration._config = {"a": {"b": 2}}
+
+    assert configuration.get("a") == {"b": 2}
+
+
+def test_get_walks_a_list_of_keys(configuration):
+    configuration._config = {"a": {"b": {"c": 3}}}
+
+    assert configuration.get(["a", "b", "c"]) == 3
+
+
+def test_get_returns_an_empty_dict_for_a_missing_key(configuration):
+    configuration._config = {"a": 1}
+
+    assert configuration.get("nope") == {}
+
+
+def test_load_returns_empty_for_a_missing_path(configuration, tmp_path):
+    assert configuration.load(str(tmp_path / "nope")) == {}
+
+
+@pytest.mark.parametrize("extension", ["toml", "json", "yaml"])
+def test_load_reads_a_single_file(configuration, tmp_path, extension):
+    content = {
+        "toml": '[syslog]\naddress = "log"\n',
+        "json": '{"syslog": {"address": "log"}}\n',
+        "yaml": "syslog:\n  address: log\n",
+    }[extension]
+    path = tmp_path / ("config." + extension)
+    path.write_text(content)
+
+    assert configuration.load(str(path)) == {"syslog": {"address": "log"}}
+    assert str(path) in configuration._config_files
+
+
+def test_load_normalizes_toml_inline_tables(configuration, tmp_path):
+    """An empty inline table parses to a plain dict: the toml parser's
+    internal type does not leak into YAML dumps of the tree."""
+    path = tmp_path / "config.toml"
+    path.write_text('[syslog]\naddress = "log"\n'
+                    '[tofu]\ndefault_modules = {}\n')
+    data = configuration.load(str(path))
+
+    dumped = yaml.dump(data)
+    assert '!!python' not in dumped
+    assert data['tofu']['default_modules'] == {}
+    assert type(data['tofu']['default_modules']).__name__ == 'dict'
+
+
+def test_load_expands_environment_variables(configuration, tmp_path,
+                                            monkeypatch):
+    monkeypatch.setenv("DEBOPS_TEST_VALUE", "hello")
+    path = tmp_path / "config.toml"
+    path.write_text('[syslog]\naddress = "$DEBOPS_TEST_VALUE"\n')
+
+    assert configuration.load(str(path)) == {"syslog": {"address": "hello"}}
+
+
+def test_load_merges_a_directory_in_sorted_order(configuration, tmp_path):
+    (tmp_path / "10-first.toml").write_text('[syslog]\naddress = "one"\n')
+    (tmp_path / "20-second.toml").write_text('[syslog]\naddress = "two"\n')
+
+    assert configuration.load(str(tmp_path)) == {"syslog": {"address": "two"}}
+
+
+def test_load_ranks_subdirectories_above_their_files(
+        configuration, tmp_path):
+    """The files of a subdirectory of a configuration directory rank
+    above every file of the directory itself: the override
+    directories work by the same rule the sorted file order uses."""
+    (tmp_path / "options.toml").write_text('[git]\ninit_message = "msg"\n')
+    (tmp_path / "override").mkdir()
+    (tmp_path / "override" / "options.toml").write_text(
+        '[git]\ninit_message = "override"\n')
+
+    assert configuration.load(str(tmp_path)) == {"git": {
+        "init_message": "override"}}
+
+
+def test_load_orders_the_subdirectories_in_sorted_order(
+        configuration, tmp_path):
+    """Several subdirectories of a configuration directory load in
+    the sorted order, the same way the files do."""
+    (tmp_path / "a-override").mkdir()
+    (tmp_path / "b-override").mkdir()
+    (tmp_path / "a-override" / "options.toml").write_text(
+        '[git]\ninit_message = "first"\n')
+    (tmp_path / "b-override" / "options.toml").write_text(
+        '[git]\ninit_message = "second"\n')
+
+    assert configuration.load(str(tmp_path)) == {"git": {
+        "init_message": "second"}}
+
+
+def test_load_records_the_origins_of_the_subdirectory_files(
+        configuration, tmp_path):
+    """The files of the subdirectories record their own origins: the
+    '--show-origin' output names the file which set each option."""
+    (tmp_path / "override").mkdir()
+    (tmp_path / "override" / "options.toml").write_text(
+        '[git]\ninit_message = "override"\n')
+    configuration.merge(str(tmp_path))
+
+    origins = configuration.config_get(
+        'git.init_message', show_origin=True)
+    assert 'override/options.toml' in origins
+
+
+def test_load_returns_empty_for_a_special_file(configuration, tmp_path):
+    path = tmp_path / "special"
+    os.mkfifo(str(path))
+
+    assert configuration.load(str(path)) == {}
+
+
+def test_load_ignores_hidden_files(configuration, tmp_path):
+    (tmp_path / ".hidden.toml").write_text('[git]\ninit_message = "x"\n')
+    (tmp_path / "visible.toml").write_text('[git]\ninit_message = "y"\n')
+
+    assert configuration.load(str(tmp_path)) == {"git": {"init_message": "y"}}
+
+
+def test_load_reports_invalid_yaml_and_keeps_going(configuration, tmp_path,
+                                                   caplog):
+    (tmp_path / "broken.yaml").write_text("a: [unterminated\n")
+    (tmp_path / "ok.toml").write_text('[git]\ninit_message = "msg"\n')
+
+    assert configuration.load(str(tmp_path)) == {"git": {"init_message":
+                                                         "msg"}}
+    assert "broken.yaml" in caplog.text
+
+
+def test_load_converts_the_legacy_debops_cfg(configuration, tmp_path):
+    path = tmp_path / ".debops.cfg"
+    path.write_text("[ansible defaults]\n"
+                    "become = True\n"
+                    "inventory = hosts\n"
+                    "\n"
+                    "[general]\n"
+                    "verbose = 1\n"
+                    "name = debops\n")
+
+    assert configuration.load(str(path)) == {
+        "ansible": {"defaults": {"become": True, "inventory": "hosts"}},
+        "general": {"verbose": True, "name": "debops"},
+    }
+
+
+def test_load_warns_and_keeps_an_unknown_root_option(
+        configuration, tmp_path, caplog):
+    typo = tmp_path / "typo.toml"
+    typo.write_text('[versionchek]\n'
+                    'enabled = true\n')
+
+    configuration.merge(str(tmp_path))
+
+    assert configuration.raw["versionchek"] == {"enabled": True}
+    assert "typo.toml" in caplog.text
+    assert ("unknown option 'versionchek', custom options belong under "
+            "the 'custom' section") in caplog.text
+
+
+def test_load_warns_and_keeps_an_unknown_nested_option(
+        configuration, tmp_path, caplog):
+    typo = tmp_path / "typo.toml"
+    typo.write_text('[syslog]\n'
+                    'flcility = "user"\n')
+
+    configuration.merge(str(tmp_path))
+
+    assert configuration.raw["syslog"]["flcility"] == "user"
+    assert "unknown option 'syslog.flcility'" in caplog.text
+    # The migration hint is for the root level, where the custom
+    # section lives
+    assert "custom options belong" not in caplog.text
+
+
+def test_load_merges_the_custom_section(configuration, tmp_path, caplog):
+    (tmp_path / "custom.yaml").write_text('custom:\n'
+                                          '  myscript:\n'
+                                          '    retries: 5\n'
+                                          '    hosts:\n'
+                                          '      - alpha\n'
+                                          '      - beta\n')
+
+    configuration.merge(str(tmp_path))
+
+    assert configuration.raw["custom"]["myscript"] == {
+        "retries": 5,
+        "hosts": ["alpha", "beta"],
+    }
+    assert "unknown option" not in caplog.text
+
+
+def test_config_get_reads_the_custom_section(configuration):
+    configuration._config = {"custom": {"myscript": {"retries": 5}}}
+
+    assert configuration.config_get("custom.myscript.retries") == "5"
+
+
+def test_apply_env_overrides_sets_custom_options(configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__CUSTOM__MYSCRIPT__RETRIES", "5")
+    monkeypatch.setenv("DEBOPS_CONFIG__CUSTOM__MYSCRIPT__TOKEN", "abc")
+
+    configuration.apply_env_overrides()
+
+    assert configuration.raw["custom"]["myscript"]["retries"] == 5
+    assert configuration.raw["custom"]["myscript"]["token"] == "abc"
+
+
+def test_load_drops_an_option_with_a_value_of_a_wrong_type(
+        configuration, tmp_path, caplog):
+    options = tmp_path / "options.toml"
+    options.write_text('[syslog]\n'
+                       'port = "five"\n'
+                       'address = "/dev/log"\n')
+
+    configuration.merge(str(tmp_path))
+
+    assert "port" not in configuration.raw["syslog"]
+    assert configuration.raw["syslog"]["address"] == "/dev/log"
+    assert ("option 'syslog.port' must be of type integer, not str"
+            in caplog.text)
+
+
+def test_load_drops_an_option_outside_of_its_enum(configuration, tmp_path,
+                                                  caplog):
+    (tmp_path / "options.toml").write_text('[syslog]\n'
+                                           'level = "notice"\n')
+
+    configuration.merge(str(tmp_path))
+
+    assert "level" not in configuration.raw["syslog"]
+    assert "must be one of" in caplog.text
+
+
+def test_load_drops_an_option_violated_inside_an_array(
+        configuration, tmp_path, caplog):
+    views = tmp_path / "views.yml"
+    views.write_text('views:\n'
+                     '  prod:\n'
+                     '    playbook_collections:\n'
+                     "      - 'debops.debops'\n"
+                     '      - 5\n')
+
+    configuration.merge(str(tmp_path))
+
+    assert "playbook_collections" not in configuration.raw["views"]["prod"]
+    assert "views.prod.playbook_collections" in caplog.text
+
+
+def test_load_accepts_the_documented_options(configuration, tmp_path,
+                                             caplog):
+    (tmp_path / "options.yaml").write_text('views:\n'
+                                           '  prod:\n'
+                                           '    playbook_collections:\n'
+                                           "      - 'debops.debops'\n"
+                                           '    ansible:\n'
+                                           '      defaults:\n'
+                                           "        inventory: 'inventory'\n")
+
+    configuration.merge(str(tmp_path))
+
+    assert (configuration.raw["views"]["prod"]["ansible"]["defaults"]
+            ["inventory"]) == "inventory"
+    assert "unknown option" not in caplog.text
+
+
+def test_load_allows_unknown_sections_inside_a_view(configuration, tmp_path,
+                                                    caplog):
+    """Legacy project directories merge free-form '.debops.cfg' sections
+    under their view; a view is not closed to unknown sections."""
+    (tmp_path / "views.yml").write_text('views:\n'
+                                        '  system:\n'
+                                        '    globals:\n'
+                                        '      verbose: 1\n')
+
+    configuration.merge(str(tmp_path))
+
+    assert configuration.raw["views"]["system"]["globals"] == {"verbose": 1}
+    assert "unknown option" not in caplog.text
+
+
+def test_load_ignores_a_file_without_a_dictionary_of_options(configuration,
+                                                             tmp_path,
+                                                             caplog):
+    (tmp_path / "list.yaml").write_text("- a\n"
+                                        "- b\n")
+    (tmp_path / "ok.toml").write_text('[git]\ninit_message = "msg"\n')
+
+    assert configuration.load(str(tmp_path)) == {"git": {"init_message":
+                                                         "msg"}}
+    assert "list.yaml" in caplog.text
+
+
+@pytest.mark.parametrize("name,content", [
+    ("broken.json", '[syslog]\nport = 514\n'),
+    ("broken.toml", '[syslog\n'),
+])
+def test_load_reports_broken_json_and_toml_files(configuration, tmp_path,
+                                                 caplog, name, content):
+    (tmp_path / name).write_text(content)
+    (tmp_path / "ok.toml").write_text('[git]\ninit_message = "msg"\n')
+
+    assert configuration.load(str(tmp_path)) == {"git": {"init_message":
+                                                         "msg"}}
+    assert name in caplog.text
+    assert configuration._violations[0]["kind"] == "parse"
+    assert configuration._violations[0]["dropped"] is True
+
+
+def test_packaged_defaults_match_the_schema(caplog):
+    import jinja2
+    import pkgutil
+    import toml
+
+    from debops.core.config import _schema_validator
+
+    template = jinja2.Template(
+        pkgutil.get_data("debops", os.path.join("_data", "defaults.toml"))
+        .decode("utf-8"), trim_blocks=True)
+    defaults = toml.loads(template.render(env=os.environ))
+
+    errors = list(_schema_validator().iter_errors(defaults))
+
+    assert not errors
+    assert not caplog.text
+
+
+def test_merge_env_reads_a_dotenv_directory(configuration, tmp_path,
+                                            monkeypatch):
+    monkeypatch.setenv("DEBOPS_TEST_FROM_ENV", "placeholder")
+    env_file = tmp_path / ".env"
+    env_file.write_text("DEBOPS_TEST_FROM_ENV=value\n")
+
+    # The 'dotenv' machinery writes the process environment directly, which
+    # otherwise leaks into every test which runs afterwards through the
+    # shared pytest environment; the patch isolates the writes and restores
+    # the original state afterwards.
+    with mock.patch.dict(os.environ):
+        configuration.merge_env(str(tmp_path))
+
+        assert configuration._env_files == [str(env_file)]
+        assert configuration._env_vars == {"DEBOPS_TEST_FROM_ENV": "value"}
+
+
+def test_merge_env_reads_a_direct_file(configuration, tmp_path, monkeypatch):
+    monkeypatch.setenv("DEBOPS_TEST_FROM_ENV", "placeholder")
+    env_file = tmp_path / "environment"
+    env_file.write_text("DEBOPS_TEST_FROM_ENV=value\n")
+
+    # See 'test_merge_env_reads_a_dotenv_directory' for the reason.
+    with mock.patch.dict(os.environ):
+        configuration.merge_env(str(env_file))
+
+        assert configuration._env_files == [str(env_file)]
+        assert configuration._env_vars == {"DEBOPS_TEST_FROM_ENV": "value"}
+
+
+def test_merge_env_accepts_a_key_without_a_value(configuration, tmp_path):
+    (tmp_path / ".env").write_text("BARE_KEY\n")
+
+    with mock.patch.dict(os.environ):
+        configuration.merge_env(str(tmp_path))
+
+    # A key without a value cannot be exported, so nothing is recorded
+    assert "BARE_KEY" not in configuration._env_vars
+
+
+def test_merge_env_ignores_a_directory_without_dotenv(configuration, tmp_path):
+    configuration.merge_env(str(tmp_path))
+
+    assert configuration._env_files == []
+    assert configuration._env_vars == {}
+
+
+def test_merge_env_applies_a_self_reference_once(configuration, tmp_path,
+                                                 monkeypatch):
+    """A variable which references its own previous value, for example
+    'PATH=/extra/bin:${PATH}', must be applied only once. Parsing the file
+    with 'dotenv.load_dotenv()' and then again with 'dotenv.dotenv_values()'
+    interpolates the second parse against the results of the first, which
+    doubles such references."""
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env_file = tmp_path / "environment"
+    env_file.write_text("PATH=/venv/bin:${PATH}\n")
+
+    # See 'test_merge_env_reads_a_dotenv_directory' for the reason.
+    with mock.patch.dict(os.environ):
+        configuration.merge_env(str(env_file))
+
+        assert configuration._env_vars["PATH"] == "/venv/bin:/usr/bin"
+
+
+def test_merge_env_expands_a_tilde_in_path(configuration, tmp_path,
+                                           monkeypatch):
+    """A '~' in a PATH entry must be expanded to the home directory; the
+    shell does not expand it during command lookup, so a literal tilde would
+    silently never match."""
+    home = os.path.expanduser("~")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env_file = tmp_path / "environment"
+    env_file.write_text("PATH=~/venv/bin:${PATH}\n")
+
+    # See 'test_merge_env_reads_a_dotenv_directory' for the reason.
+    with mock.patch.dict(os.environ):
+        configuration.merge_env(str(env_file))
+
+        expected = home + "/venv/bin:/usr/bin"
+        assert configuration._env_vars["PATH"] == expected
+
+
+def test_merge_env_expands_a_tilde_in_other_path_variables(configuration,
+                                                           tmp_path):
+    env_file = tmp_path / "environment"
+    env_file.write_text("PYTHONPATH=~/lib:~root/lib\n")
+
+    # See 'test_merge_env_reads_a_dotenv_directory' for the reason.
+    with mock.patch.dict(os.environ):
+        configuration.merge_env(str(env_file))
+
+        expected = (os.path.expanduser("~") + "/lib:"
+                    + os.path.expanduser("~root") + "/lib")
+        assert configuration._env_vars["PYTHONPATH"] == expected
+
+
+def test_merge_env_keeps_a_literal_tilde_in_other_variables(configuration,
+                                                            tmp_path):
+    env_file = tmp_path / "environment"
+    env_file.write_text("DEBOPS_TEST_TILDE=~/literal\n")
+
+    # See 'test_merge_env_reads_a_dotenv_directory' for the reason.
+    with mock.patch.dict(os.environ):
+        configuration.merge_env(str(env_file))
+
+        assert configuration._env_vars["DEBOPS_TEST_TILDE"] == "~/literal"
+
+
+def test_merge_env_ignores_a_missing_path(configuration, tmp_path):
+    configuration.merge_env(str(tmp_path / "nope"))
+
+    assert configuration._env_files == []
+    assert configuration._env_vars == {}
+
+
+def test_set_env_records_the_environment(configuration):
+    configuration.set_env("DEBOPS_TEST_ENV", 1)
+
+    assert configuration._env_vars["DEBOPS_TEST_ENV"] == "1"
+
+
+def test_get_env_returns_none_when_unset(configuration, monkeypatch):
+    monkeypatch.delenv("DEBOPS_TEST_ENV", raising=False)
+
+    assert configuration.get_env("DEBOPS_TEST_ENV") is None
+
+
+def test_get_env_returns_the_value(configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_TEST_ENV", "value")
+
+    assert configuration.get_env("DEBOPS_TEST_ENV") == "value"
+
+
+def test_config_get_returns_a_scalar(configuration):
+    configuration._config = {"a": "b"}
+
+    assert configuration.config_get("a") == "b"
+
+
+def test_config_get_returns_a_nested_key(configuration):
+    configuration._config = {"a": {"b": "c"}}
+
+    assert configuration.config_get("a.b") == "c"
+
+
+def test_config_get_returns_the_whole_configuration_for_dot(configuration):
+    configuration._config = {"a": "b"}
+
+    assert configuration.config_get(".") == "a: b"
+
+
+def test_config_get_formats_a_boolean_as_json(configuration):
+    configuration._config = {"a": True}
+
+    assert configuration.config_get("a", format="json") == "true"
+
+
+def test_config_get_renders_a_list_in_the_default_format(configuration):
+    configuration._config = {"a": ["x", "y"]}
+
+    assert configuration.config_get("a") == "- x\n- y"
+
+
+def test_config_get_renders_the_unix_format_dotted(configuration):
+    configuration._config = {"syslog": {"level": "NOTICE", "port": 514}}
+
+    assert configuration.config_get(
+        "syslog", format="unix") == "syslog.level=NOTICE\nsyslog.port=514"
+
+
+def test_config_get_renders_a_scalar_query_dotted(configuration):
+    configuration._config = {"syslog": {"level": "NOTICE"}}
+
+    assert configuration.config_get(
+        "syslog.level", format="unix") == "syslog.level=NOTICE"
+
+
+def test_config_get_renders_a_list_comma_separated(configuration):
+    configuration._config = {"custom": {"tools": ["ansible", "tofu"]}}
+
+    assert configuration.config_get(
+        "custom.tools", format="unix") == "custom.tools=ansible,tofu"
+
+
+def test_config_get_renders_an_empty_list_with_an_empty_value(configuration):
+    configuration._config = {"custom": {"empty": []}}
+
+    assert configuration.config_get(
+        "custom.empty", format="unix") == "custom.empty="
+
+
+def test_config_get_renders_an_empty_section_as_an_empty_object(configuration):
+    configuration._config = {"custom": {}}
+
+    assert configuration.config_get(
+        "custom", format="unix") == "custom={}"
+
+
+def test_config_get_renders_a_boolean_as_a_json_literal(configuration):
+    configuration._config = {"version_check": {"enabled": False}}
+
+    assert configuration.config_get(
+        "version_check.enabled",
+        format="unix") == "version_check.enabled=false"
+
+
+def test_config_get_renders_the_whole_tree_sorted(configuration):
+    configuration._config = {"b": {"k": "v"}, "a": True}
+
+    assert configuration.config_get(".", format="unix") == "a=true\nb.k=v"
+
+
+def test_config_get_ignores_the_root_option_in_the_unix_format(configuration):
+    configuration._config = {"syslog": {"facility": "user"}}
+
+    assert configuration.config_get(
+        "syslog.facility", format="unix",
+        root=True) == "syslog.facility=user"
+
+
+def test_config_get_lists_the_keys_as_dotted_paths(configuration):
+    configuration._config = {"syslog": {"port": 514, "level": "NOTICE"}}
+
+    assert configuration.config_get(
+        "syslog", format="unix",
+        keys=True) == "syslog.level\nsyslog.port"
+
+
+def test_config_get_takes_the_default_format_from_the_option(configuration):
+    configuration._config = {"config": {"default_output": "unix"},
+                             "syslog": {"level": "NOTICE"}}
+
+    assert configuration.config_get("syslog.level") == "syslog.level=NOTICE"
+
+
+def test_config_get_falls_back_to_the_yaml_format(configuration):
+    configuration._config = {"syslog": {"level": "NOTICE"}}
+
+    assert configuration.config_get("syslog.level") == "NOTICE"
+
+
+def test_config_get_renders_a_yaml_scalar_without_the_document_marker(
+        configuration):
+    configuration._config = {"a": "b"}
+
+    assert configuration.config_get("a", format="yaml") == "b"
+
+
+def test_config_get_renders_a_yaml_boolean_without_the_document_marker(
+        configuration):
+    configuration._config = {"a": False}
+
+    assert configuration.config_get("a", format="yaml") == "false"
+
+
+def test_config_get_json_sorts_keys(configuration):
+    configuration._config = {"b": 1, "a": 2}
+
+    out = configuration.config_get(".", format="json")
+    assert out.index('"a"') < out.index('"b"')
+
+
+def test_config_get_raises_for_a_missing_key(configuration):
+    configuration._config = {"a": "b"}
+
+    with pytest.raises(OptionNotFoundError):
+        configuration.config_get("nope", format="json")
+
+
+def test_config_get_raises_for_a_missing_key_in_every_format(configuration):
+    configuration._config = {"a": "b"}
+
+    for fmt in ("unix", "yaml", "json", "toml"):
+        with pytest.raises(OptionNotFoundError):
+            configuration.config_get("nope", format=fmt)
+
+
+@pytest.mark.parametrize("fmt", ["json", "toml"])
+def test_config_get_formats_a_boolean_in_every_style(configuration, fmt):
+    """Boolean values render as JSON literals in the 'json' and 'toml'
+    formats, keeping the output comparable across the callers.
+    """
+    configuration._config = {"a": True}
+
+    assert configuration.config_get("a", format=fmt) == "true"
+
+
+def test_config_get_formats_a_list_as_yaml(configuration):
+    configuration._config = {"a": ["x", "y"]}
+
+    assert configuration.config_get("a", format="yaml") == "- x\n- y"
+
+
+@pytest.mark.parametrize("fmt", ["json", "toml"])
+def test_config_get_formats_a_scalar_in_every_style(configuration, fmt):
+    configuration._config = {"a": "b"}
+
+    assert configuration.config_get("a", format=fmt) == '"b"'
+
+
+def test_init_loads_the_default_configuration(tmp_path, monkeypatch):
+    # xdg_config_home is imported into the module at import time, so the
+    # environment variable alone is not enough
+    monkeypatch.setattr(config_module, "xdg_config_home", str(tmp_path))
+    monkeypatch.setenv("DEBOPS_ANSIBLE_COLLECTIONS_PATH", "sentinel")
+
+    config = config_module.Configuration()
+
+    assert config.raw["binaries"]["ansible"] == "ansible"
+    assert config.raw["git"]["init_message"] == \
+        "Initialize new DebOps project directory"
+    assert (config._env_vars["DEBOPS_ANSIBLE_COLLECTIONS_PATH"]
+            != "sentinel")
+
+
+def test_init_reads_the_user_configuration_and_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_module, "xdg_config_home", str(tmp_path))
+    monkeypatch.setenv("DEBOPS_ANSIBLE_COLLECTIONS_PATH", "sentinel")
+    monkeypatch.setenv("DEBOPS_TEST_MARKER", "sentinel")
+    user_conf_d = tmp_path / "debops" / "conf.d"
+    user_conf_d.mkdir(parents=True)
+    (user_conf_d / "10-user.toml").write_text(
+        'git = { init_message = "custom" }\n')
+    (tmp_path / "debops" / "environment").write_text(
+        "DEBOPS_TEST_MARKER=from-user-env\n")
+
+    config = config_module.Configuration()
+
+    # The user configuration directory and environment file are read from
+    # the lowercase 'debops' directory under the XDG configuration home
+    assert config.raw["git"]["init_message"] == "custom"
+    assert config._env_vars["DEBOPS_TEST_MARKER"] == "from-user-env"
+    # The variable is stored with the home directory collapsed to '~'
+    assert config._env_vars["DEBOPS_ANSIBLE_COLLECTIONS_PATH"] == unexpanduser(
+        os.path.join(config_module.DEBOPS_PACKAGE_DATA, "ansible",
+                     "collections"))
+
+
+def test_init_records_the_scope_of_the_configuration_layers(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(config_module, "xdg_config_home", str(tmp_path))
+    user_conf_d = tmp_path / "debops" / "conf.d"
+    user_conf_d.mkdir(parents=True)
+    (user_conf_d / "10-user.toml").write_text(
+        'git = { init_message = "custom" }\n')
+
+    config = config_module.Configuration()
+
+    origins = dict(
+        (option, (scope, origin))
+        for option, scope, origin, value in
+        config.config_origins("git.init_message"))
+
+    assert origins["git.init_message"] == (
+        "user", str(user_conf_d / "10-user.toml"))
+
+
+def test_merge_accepts_a_dictionary(configuration):
+    configuration._config = {"a": 1}
+
+    configuration.merge({"b": 2})
+
+    assert configuration.raw == {"a": 1, "b": 2}
+
+
+def test_merge_loads_from_a_directory(configuration, tmp_path):
+    (tmp_path / "10-extra.toml").write_text('[git]\ninit_message = "msg"\n')
+
+    configuration.merge(str(tmp_path))
+
+    assert configuration.raw["git"] == {"init_message": "msg"}
+
+
+def test_config_list_returns_env_and_config_files(configuration, tmp_path):
+    env_file = tmp_path / "project" / ".env"
+    config_file = tmp_path / "project" / ".debops.cfg"
+    configuration._env_files = [str(env_file)]
+    configuration._config_files = [str(config_file)]
+
+    lines = configuration.config_list()
+
+    assert "# Environment files:" in lines
+    assert "# Configuration files:" in lines
+    assert any(".env" in line for line in lines)
+    assert any(".debops.cfg" in line for line in lines)
+
+
+def test_config_list_without_env_files(configuration, tmp_path):
+    configuration._config_files = [str(tmp_path / "project" / ".debops.cfg")]
+
+    lines = configuration.config_list()
+
+    assert "# Environment files:" not in lines
+    assert "# Configuration files:" in lines
+
+
+def test_config_get_formats_a_dict_as_toml(configuration):
+    configuration._config = {"a": {"b": 1}}
+
+    assert "b = 1" in configuration.config_get("a", format="toml")
+
+
+def test_config_get_formats_a_list_as_json(configuration):
+    configuration._config = {"a": ["x", "y"]}
+
+    assert '["x", "y"]' in configuration.config_get("a", format="json")
+
+
+def test_config_get_formats_a_scalar_as_yaml(configuration):
+    configuration._config = {"a": "b"}
+
+    assert "b" in configuration.config_get("a", format="yaml")
+
+
+def test_config_get_formats_a_boolean_as_yaml(configuration):
+    configuration._config = {"a": True}
+
+    assert "true" in configuration.config_get("a", format="yaml")
+
+
+def test_config_get_lists_the_keys_of_a_dict(configuration):
+    configuration._config = {"a": {"b": 1, "c": 2}}
+
+    out = configuration.config_get("a", keys=True)
+    assert "b" in out
+    assert "c" in out
+
+
+def test_config_get_keys_on_a_scalar_render_an_empty_list(configuration):
+    configuration._config = {"a": 1}
+
+    assert configuration.config_get("a", keys=True) == "[]"
+
+
+def test_config_get_keys_on_a_scalar_render_nothing_in_the_unix_format(
+        configuration):
+    configuration._config = {"a": 1}
+
+    assert configuration.config_get("a", keys=True, format="unix") is None
+
+
+def test_config_get_root_renders_the_full_path(configuration):
+    configuration._config = {"views": {"system": {"ansible": {
+        "defaults": {"inventory": "hosts"}}}}}
+
+    out = configuration.config_get("views.system.ansible", root=True)
+
+    assert "views:" in out
+    assert "  system:" in out
+    assert "    ansible:" in out
+    assert "        inventory: hosts" in out
+
+
+def test_config_get_root_renders_nested_json(configuration):
+    import json
+
+    configuration._config = {"syslog": {"level": "NOTICE"}}
+
+    out = configuration.config_get("syslog.level", format="json", root=True)
+
+    assert json.loads(out) == {"syslog": {"level": "NOTICE"}}
+
+
+def test_config_get_root_wraps_a_scalar(configuration):
+    configuration._config = {"syslog": {"facility": "user"}}
+
+    out = configuration.config_get("syslog.facility", root=True)
+
+    assert "syslog:" in out
+    assert "  facility: user" in out
+
+
+def test_config_get_root_leaves_the_whole_tree_unchanged(configuration):
+    configuration._config = {"syslog": {"facility": "user"}}
+
+    out = configuration.config_get(".", root=True)
+
+    assert "syslog:" in out
+    assert "  facility: user" in out
+    assert out.count("syslog:") == 1
+
+
+def test_config_get_root_wraps_the_key_listing(configuration):
+    configuration._config = {"views": {"system": {"ansible": {}}}}
+
+    out = configuration.config_get("views.system.ansible", keys=True,
+                                   root=True)
+
+    assert "ansible:" in out
+
+
+def test_config_get_root_raises_for_a_missing_option(configuration):
+    with pytest.raises(OptionNotFoundError):
+        configuration.config_get("views.system.nope", root=True)
+
+
+def test_config_get_treats_a_scalar_path_element_as_missing(configuration):
+    configuration._config = {"project": {"view": "system"}}
+
+    with pytest.raises(OptionNotFoundError):
+        configuration.config_get("project.view.ansible")
+
+
+def test_get_treats_a_scalar_path_element_as_missing(configuration):
+    configuration._config = {"project": {"view": "system"}}
+
+    assert configuration.get(["project", "view", "ansible"]) == {}
+
+
+def test_apply_env_overrides_sets_a_nested_option(configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__SYSLOG__PORT", "514")
+
+    configuration.apply_env_overrides()
+
+    assert configuration.raw["syslog"]["port"] == 514
+
+
+def test_apply_env_overrides_coerces_a_boolean(configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__VERSION_CHECK__ENABLED", "true")
+
+    configuration.apply_env_overrides()
+
+    assert configuration.raw["version_check"]["enabled"] is True
+
+
+def test_apply_env_overrides_set_the_default_output(configuration,
+                                                    monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__CONFIG__DEFAULT_OUTPUT", "unix")
+    monkeypatch.setenv("DEBOPS_CONFIG__SYSLOG__LEVEL", "DEBUG")
+
+    configuration.apply_env_overrides()
+
+    assert (configuration.config_get("syslog.level")
+            == "syslog.level=DEBUG")
+
+
+def test_apply_env_overrides_parses_a_list(configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__VIEWS__PROD__PLAYBOOK_COLLECTIONS",
+                       "debops.debops, custom.collection")
+
+    configuration.apply_env_overrides()
+
+    assert (configuration.raw["views"]["prod"]["playbook_collections"]
+            == ["debops.debops", "custom.collection"])
+
+
+def test_apply_env_overrides_do_not_duplicate_list_entries(configuration,
+                                                           monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__TOFU__OPERATIONS", "plan,apply")
+
+    configuration.apply_env_overrides()
+    configuration.merge({"tofu": {"operations": ["local"]}})
+    configuration.apply_env_overrides()
+
+    assert (configuration.raw["tofu"]["operations"]
+            == ["plan", "apply", "local"])
+
+
+def test_apply_env_overrides_splits_untyped_comma_values(configuration,
+                                                         monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__CUSTOM__MYSCRIPT__TOOLS",
+                       "ansible, lxc")
+
+    configuration.apply_env_overrides()
+
+    assert (configuration.raw["custom"]["myscript"]["tools"]
+            == ["ansible", "lxc"])
+
+
+def test_apply_env_overrides_auto_types_untyped_comma_elements(
+        configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__CUSTOM__MYSCRIPT__PORTS", "514,515")
+
+    configuration.apply_env_overrides()
+
+    assert (configuration.raw["custom"]["myscript"]["ports"]
+            == [514, 515])
+
+
+def test_apply_env_overrides_keeps_a_json_string_with_a_comma(
+        configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__CUSTOM__MYSCRIPT__NOTES", '"a,b"')
+
+    configuration.apply_env_overrides()
+
+    assert (configuration.raw["custom"]["myscript"]["notes"]
+            == "a,b")
+
+
+def test_apply_env_overrides_parses_a_json_array_override(configuration,
+                                                          monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__CUSTOM__MYSCRIPT__IDS", "[1, 2]")
+
+    configuration.apply_env_overrides()
+
+    assert configuration.raw["custom"]["myscript"]["ids"] == [1, 2]
+
+
+def test_apply_env_overrides_expands_variables(configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_TEST_USER", "joe")
+    monkeypatch.setenv("DEBOPS_CONFIG__GIT__INIT_MESSAGE",
+                       "set by ${DEBOPS_TEST_USER}")
+
+    configuration.apply_env_overrides()
+
+    assert configuration.raw["git"]["init_message"] == "set by joe"
+
+
+def test_apply_env_overrides_keeps_a_hyphenated_key(configuration,
+                                                    monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__BINARIES__ANSIBLE-INVENTORY",
+                       "/usr/bin/ansible-inventory")
+
+    configuration.apply_env_overrides()
+
+    assert (configuration.raw["binaries"]["ansible-inventory"]
+            == "/usr/bin/ansible-inventory")
+
+
+def test_apply_env_overrides_matches_segments_case_insensitively(
+        configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__SYSLOG__ADDRESS", "/dev/log")
+
+    configuration.apply_env_overrides()
+
+    assert configuration.raw["syslog"]["address"] == "/dev/log"
+
+
+def test_apply_env_overrides_ignores_an_unknown_option(configuration,
+                                                       monkeypatch,
+                                                       caplog):
+    monkeypatch.setenv("DEBOPS_CONFIG__SYSLOG__FLCILITY", "user")
+
+    configuration.apply_env_overrides()
+
+    assert "flcility" not in configuration.raw
+    assert "DEBOPS_CONFIG__SYSLOG__FLCILITY" in caplog.text
+    assert "unknown option 'syslog.flcility'" in caplog.text
+
+
+def test_apply_env_overrides_ignores_a_value_of_a_wrong_type(configuration,
+                                                             monkeypatch,
+                                                             caplog):
+    monkeypatch.setenv("DEBOPS_CONFIG__SYSLOG__PORT", "five")
+
+    configuration.apply_env_overrides()
+
+    assert "syslog" not in configuration.raw
+    assert "DEBOPS_CONFIG__SYSLOG__PORT" in caplog.text
+
+
+def test_apply_env_overrides_rank_above_the_configuration_files(
+        configuration, tmp_path, monkeypatch):
+    (tmp_path / "options.toml").write_text('[syslog]\nport = 999\n')
+
+    configuration.merge(str(tmp_path))
+    monkeypatch.setenv("DEBOPS_CONFIG__SYSLOG__PORT", "514")
+
+    configuration.apply_env_overrides()
+
+    assert configuration.raw["syslog"]["port"] == 514
+
+
+def test_apply_env_overrides_parses_json_in_an_open_section(configuration,
+                                                            monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__VIEWS__PROD__ANSIBLE",
+                       '{"defaults": {"inventory": "hosts"}}')
+
+    configuration.apply_env_overrides()
+
+    assert (configuration.raw["views"]["prod"]["ansible"]
+            == {"defaults": {"inventory": "hosts"}})
+
+
+def test_apply_env_overrides_keep_a_string_in_an_open_section(configuration,
+                                                              monkeypatch):
+    monkeypatch.setenv(
+        "DEBOPS_CONFIG__VIEWS__PROD__ANSIBLE__DEFAULTS__INVENTORY",
+        "hosts")
+
+    configuration.apply_env_overrides()
+
+    assert (configuration.raw["views"]["prod"]["ansible"]["defaults"]
+            ["inventory"]) == "hosts"
+
+
+def test_config_list_lists_the_environment_overrides(configuration,
+                                                     monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__SYSLOG__LEVEL", "DEBUG")
+
+    configuration.apply_env_overrides()
+
+    lines = configuration.config_list()
+
+    assert "# Environment variable overrides:" in lines
+    assert "DEBOPS_CONFIG__SYSLOG__LEVEL" in lines
+
+
+def test_option_file_defaults_to_the_override_location(configuration,
+                                                       tmp_path):
+    """The managed file lives in the 'override/' subdirectory of the
+    configuration directory: the subdirectory merge ranks it above
+    the hand-written files of the directory."""
+    path = configuration.option_file(str(tmp_path))
+
+    assert path == str(tmp_path / "override" / "99_config_set.json")
+
+
+def test_option_file_migrates_the_legacy_file(configuration, tmp_path):
+    """The file the command managed at the top level of the
+    directory -- the legacy location, which the letter-named files
+    of the directory outranked -- migrates into the override
+    location with its content when the command writes."""
+    (tmp_path / "50_config_set.json").write_text(
+        '{"custom": {"greeting": "hello"}}\n')
+
+    path = configuration.option_file(str(tmp_path))
+
+    assert path == str(tmp_path / "override" / "99_config_set.json")
+    assert not (tmp_path / "50_config_set.json").exists()
+    migrated = json.loads(open(path).read())
+    assert migrated == {"custom": {"greeting": "hello"}}
+
+
+def test_option_file_follows_the_configured_name(configuration, tmp_path):
+    """The 'config.override_filename' option places the managed file:
+    the name is the operator's, relative to the directory."""
+    configuration.merge({"config": {"override_filename": "my.json"}})
+
+    path = configuration.option_file(str(tmp_path))
+
+    assert path == str(tmp_path / "my.json")
+
+
+def test_option_file_refuses_escaping_names(configuration, tmp_path):
+    """The managed file stays inside the configuration directory: an
+    absolute path, the parent segments and the empty segments are
+    refused with the option named."""
+    for filename in ("/etc/debops.json", "../debops.json",
+                     "override/../debops.json", "override//x.json",
+                     "  "):
+        configuration.merge({"config": {"override_filename":
+                                        filename}})
+        with pytest.raises(ValueError, match="override_filename"):
+            configuration.option_file(str(tmp_path))
+
+
+def test_option_file_skips_hidden_and_unrelated_files(configuration,
+                                                      tmp_path):
+    (tmp_path / ".99_config_set.json").write_text("{}\n")
+    (tmp_path / "config_set.json").write_text("{}\n")
+    (tmp_path / "options.yml").write_text("a: 1\n")
+
+    path = configuration.option_file(str(tmp_path))
+
+    assert path == str(tmp_path / "override" / "99_config_set.json")
+
+
+def test_option_file_refuses_ambiguous_files(configuration, tmp_path):
+    (tmp_path / "50_config_set.json").write_text("{}\n")
+    (tmp_path / "99_config_set.json").write_text("{}\n")
+
+    with pytest.raises(ValueError):
+        configuration.option_file(str(tmp_path))
+
+
+def test_shadowing_file_finds_the_later_file(configuration, tmp_path):
+    """A file of the managed file's directory which sorts after it
+    and defines the option shadows the managed value: the helper
+    returns the file and the value which wins."""
+    managed = tmp_path / "override" / "99_config_set.json"
+    managed.parent.mkdir()
+    managed.write_text('{"tofu": {"inventory": {"hosts_format": '
+                       '"toml"}}}\n')
+    (tmp_path / "override" / "z-late.toml").write_text(
+        '[tofu.inventory]\nhosts_format = "ini"\n')
+
+    shadow = config_module.shadowing_file(str(managed), "tofu.inventory.hosts_format")
+
+    assert shadow[0] == str(tmp_path / "override" / "z-late.toml")
+    assert shadow[1] == "ini"
+
+
+def test_shadowing_file_ignores_the_files_which_load_before(
+        configuration, tmp_path):
+    """The files sorting before the managed file load before it too:
+    they do not shadow anything."""
+    managed = tmp_path / "override" / "99_config_set.json"
+    managed.parent.mkdir()
+    managed.write_text('{"tofu": {"inventory": {"hosts_format": '
+                       '"toml"}}}\n')
+    (tmp_path / "override" / "10-early.toml").write_text(
+        '[tofu.inventory]\nhosts_format = "ini"\n')
+
+    assert config_module.shadowing_file(
+        str(managed), "tofu.inventory.hosts_format") is None
+
+
+def test_shadowing_file_scans_the_subdirectories(configuration, tmp_path):
+    """The files of the subdirectories of the managed file's
+    directory rank above it: the helper scans them."""
+    managed = tmp_path / "override" / "99_config_set.json"
+    managed.parent.mkdir()
+    managed.write_text('{"custom": {"greeting": "set"}}\n')
+    (tmp_path / "override" / "deep").mkdir()
+    (tmp_path / "override" / "deep" / "later.yml").write_text(
+        'custom:\n  greeting: shadowed\n')
+
+    shadow = config_module.shadowing_file(str(managed), "custom.greeting")
+
+    assert shadow[1] == "shadowed"
+
+
+def test_shadowing_file_ignores_the_missing_directory(tmp_path):
+    assert config_module.shadowing_file(
+        str(tmp_path / "gone" / "options.json"),
+        "custom.greeting") is None
+
+
+def test_write_option_sets_a_typed_option(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "syslog.port", "514")
+
+    assert json.loads(path.read_text()) == {"syslog": {"port": 514}}
+
+
+def test_write_option_sets_a_boolean(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "version_check.enabled",
+                               "true")
+
+    assert json.loads(path.read_text()) == {"version_check":
+                                            {"enabled": True}}
+
+
+def test_write_option_creates_the_parent_sections(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "views.system.ansible",
+                               '{"defaults": {}}')
+
+    assert json.loads(path.read_text()) == {
+        "views": {"system": {"ansible": {"defaults": {}}}}}
+
+
+def test_write_option_updates_the_file_in_place(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "custom.myscript.retries", "5")
+    configuration.write_option(str(path), "custom.myscript.token", "abc")
+
+    assert json.loads(path.read_text()) == {
+        "custom": {"myscript": {"retries": 5, "token": "abc"}}}
+
+
+def test_write_option_sets_a_custom_object(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "custom.myscript",
+                               '{"a": 1}')
+
+    assert json.loads(path.read_text()) == {
+        "custom": {"myscript": {"a": 1}}}
+
+
+def test_write_option_appends_to_a_list_option(configuration, tmp_path):
+    """A list option accumulates the values: the values are appended
+    to the list of the file."""
+    path = tmp_path / "99_config_set.json"
+
+    assert configuration.write_option(
+        str(path), "tofu.mkview.default_providers",
+        ["lxc/incus", "hashicorp/tfcoremock"]) == 'append'
+    assert configuration.write_option(
+        str(path), "tofu.mkview.default_providers", ["lxc/incus"]) == 'none'
+
+    assert json.loads(path.read_text()) == {
+        "tofu": {"mkview": {"default_providers": ["lxc/incus", "hashicorp/tfcoremock"]}}}
+
+
+def test_write_option_dedupes_against_the_effective_list(
+        configuration, tmp_path):
+    """A value which the effective configuration carries already is
+    skipped: the effective list decides what the option contains."""
+    configuration._config = {"tofu": {"mkview": {"default_providers": ["lxc/incus"]}}}
+    path = tmp_path / "99_config_set.json"
+
+    assert configuration.write_option(
+        str(path), "tofu.mkview.default_providers", ["lxc/incus"]) == 'none'
+
+    assert not path.exists()
+
+
+def test_write_option_dedupes_within_the_values(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "tofu.mkview.default_providers",
+                               ["lxc/incus", "lxc/incus"])
+
+    assert json.loads(path.read_text()) == {
+        "tofu": {"mkview": {"default_providers": ["lxc/incus"]}}}
+
+
+def test_write_option_appends_a_single_value_to_a_list_option(
+        configuration, tmp_path):
+    """The type of the option decides between the set and the append:
+    one value on a list option appends."""
+    path = tmp_path / "99_config_set.json"
+
+    assert configuration.write_option(
+        str(path), "tofu.mkview.default_providers", ["lxc/incus"]) == 'append'
+    assert configuration.write_option(
+        str(path), "tofu.mkview.default_providers",
+        ["hashicorp/tfcoremock"]) == 'append'
+
+    assert json.loads(path.read_text()) == {
+        "tofu": {"mkview": {"default_providers": ["lxc/incus", "hashicorp/tfcoremock"]}}}
+
+
+def test_write_option_refuses_multiple_values_for_a_scalar(
+        configuration, tmp_path, caplog):
+    path = tmp_path / "99_config_set.json"
+
+    with pytest.raises(OptionRefused):
+        configuration.write_option(str(path), "syslog.port",
+                                   ["514", "515"])
+
+    assert not path.exists()
+    assert 'holds a singular value' in caplog.text
+
+
+def test_write_option_refuses_the_list_conversion_of_a_scalar(
+        configuration, tmp_path, caplog):
+    """A singular value is never converted to a list: the type
+    changes through the removal of the option and its re-creation."""
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"custom": {"greeting": "hello"}}\n')
+
+    with pytest.raises(OptionRefused):
+        configuration.write_option(str(path), "custom.greeting",
+                                   ["world"], option_type='list')
+
+    assert 'the type changes through the removal' in caplog.text
+
+
+def test_write_option_creates_an_empty_list_option(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    assert configuration.write_option(
+        str(path), "custom.tools", option_type='list') == 'create'
+
+    assert json.loads(path.read_text()) == {"custom": {"tools": []}}
+
+
+def test_write_option_creates_an_empty_integer_option(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "custom.retries",
+                               option_type='int')
+
+    assert json.loads(path.read_text()) == {"custom": {"retries": 0}}
+
+
+def test_write_option_creates_an_empty_string_option(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "custom.greeting",
+                               option_type='str')
+
+    assert json.loads(path.read_text()) == {"custom": {"greeting": ""}}
+
+
+def test_write_option_creates_an_empty_object_option(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "custom.myscript",
+                               option_type='dict')
+
+    assert json.loads(path.read_text()) == {"custom": {"myscript": {}}}
+
+
+def test_write_option_refuses_an_empty_boolean_option(configuration, tmp_path,
+                                                      caplog):
+    with pytest.raises(OptionRefused):
+        configuration.write_option(str(tmp_path / "f.json"),
+                                   "custom.enabled", option_type='bool')
+
+    assert 'needs a value' in caplog.text
+
+
+def test_write_option_refuses_the_creation_of_a_set_option(
+        configuration, tmp_path, caplog):
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"custom": {"greeting": "hello"}}\n')
+
+    with pytest.raises(OptionRefused):
+        configuration.write_option(str(path), "custom.greeting",
+                                   option_type='str')
+
+    assert 'already set' in caplog.text
+
+
+def test_write_option_sets_a_string_verbatim(configuration, tmp_path):
+    """The '--type str' option keeps the value as a string: no
+    automatic typing."""
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "custom.greeting", ["3"],
+                               option_type='str')
+
+    assert json.loads(path.read_text()) == {"custom": {"greeting": "3"}}
+
+
+def test_write_option_refuses_the_wrong_explicit_type(
+        configuration, tmp_path, caplog):
+    """The schema is the contract of the typed options: the '--type'
+    option cannot override it."""
+    path = tmp_path / "99_config_set.json"
+
+    with pytest.raises(OptionRefused):
+        configuration.write_option(str(path), "syslog.port", ["514"],
+                                   option_type='str')
+
+    assert not path.exists()
+    assert "typed 'integer' by the configuration schema" in caplog.text
+
+
+def test_write_option_types_the_options_of_an_open_section(
+        configuration, tmp_path):
+    """The sections the schema leaves open -- the 'custom' section and
+    the ansible options of the views -- are governed by the '--type'
+    option."""
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "custom.port", ["514"],
+                               option_type='int')
+    configuration.write_option(
+        str(path), "views.system.ansible.defaults.timeout", ["30"],
+        option_type='int')
+
+    assert json.loads(path.read_text()) == {
+        "custom": {"port": 514},
+        "views": {"system": {"ansible": {"defaults": {"timeout": 30}}}}}
+
+
+def test_write_option_sets_a_dict_from_json(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "custom.myscript",
+                               ['{"a": 1}'], option_type='dict')
+
+    assert json.loads(path.read_text()) == {
+        "custom": {"myscript": {"a": 1}}}
+
+
+def test_write_option_refuses_multiple_values_for_a_dict(
+        configuration, tmp_path, caplog):
+    with pytest.raises(OptionRefused):
+        configuration.write_option(str(tmp_path / "f.json"),
+                                   "custom.myscript",
+                                   ['{"a": 1}', '{"b": 2}'],
+                                   option_type='dict')
+
+    assert 'holds a singular value' in caplog.text
+
+
+def test_write_option_prunes_the_values_of_a_list_option(
+        configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"tofu": {"mkview": {"default_providers": '
+                    '["lxc/incus", "hashicorp/tfcoremock"]}}}\n')
+
+    assert configuration.write_option(
+        str(path), "tofu.mkview.default_providers", ["lxc/incus"],
+        delete=True) == 'prune'
+
+    assert json.loads(path.read_text()) == {
+        "tofu": {"mkview": {"default_providers": ["hashicorp/tfcoremock"]}}}
+
+
+def test_write_option_removes_an_emptied_list_option(configuration, tmp_path):
+    """A list which empties removes the option together with the
+    sections left empty: the lower layers show through."""
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"tofu": {"mkview": {"default_providers": ["lxc/incus"]}}}\n')
+
+    assert configuration.write_option(
+        str(path), "tofu.mkview.default_providers", ["lxc/incus"],
+        delete=True) == 'delete'
+
+    assert json.loads(path.read_text()) == {}
+
+
+def test_write_option_delete_of_missing_values_is_clean(
+        configuration, tmp_path):
+    """The values which the list of the file does not carry are a
+    clean exit: the removal is idempotent."""
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"tofu": {"mkview": {"default_providers": ["lxc/incus"]}}}\n')
+
+    assert configuration.write_option(
+        str(path), "tofu.mkview.default_providers", ["hashicorp/tfcoremock"],
+        delete=True) == 'none'
+
+    assert json.loads(path.read_text()) == {
+        "tofu": {"mkview": {"default_providers": ["lxc/incus"]}}}
+
+
+def test_write_option_reports_the_values_of_other_layers(
+        configuration, tmp_path, caplog):
+    """The values which stay present in the effective configuration
+    through other layers are reported: the removal of the file's list
+    does not reach them."""
+    configuration._layers = [
+        ('defaults', 'defaults.toml',
+         {"tofu": {"operations": ["apply"]}})]
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"tofu": {"operations": ["apply", "plan"]}}\n')
+
+    configuration.write_option(str(path), "tofu.operations",
+                               ["apply", "plan"], delete=True)
+
+    assert json.loads(path.read_text()) == {}
+    assert "still present in the effective configuration" in caplog.text
+    assert 'defaults.toml' in caplog.text
+
+
+def test_write_option_refuses_to_remove_values_from_a_scalar(
+        configuration, tmp_path, caplog):
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"syslog": {"level": "DEBUG"}}\n')
+
+    with pytest.raises(OptionRefused):
+        configuration.write_option(str(path), "syslog.level",
+                                   ["DEBUG"], delete=True)
+
+    assert 'holds a singular value' in caplog.text
+
+
+def test_write_option_expands_variables(configuration, tmp_path,
+                                        monkeypatch):
+    monkeypatch.setenv("DEBOPS_TEST_VALUE", "hello")
+    path = tmp_path / "99_config_set.json"
+
+    configuration.write_option(str(path), "custom.myscript.token",
+                               "$DEBOPS_TEST_VALUE")
+
+    assert json.loads(path.read_text()) == {
+        "custom": {"myscript": {"token": "hello"}}}
+
+
+def test_write_option_refuses_an_unknown_option(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+
+    with pytest.raises(ValueError) as errmsg:
+        configuration.write_option(str(path), "myscript.retries", "5")
+
+    assert "custom options belong under the 'custom' section" \
+        in str(errmsg.value)
+    assert not path.exists()
+
+
+def test_write_option_refuses_a_value_of_a_wrong_type(configuration,
+                                                      tmp_path, caplog):
+    path = tmp_path / "99_config_set.json"
+
+    with pytest.raises(OptionRefused):
+        configuration.write_option(str(path), "syslog.port", "five")
+
+    assert not path.exists()
+    assert "typed 'integer'" in caplog.text
+    assert "the value 'five' does not fit it" in caplog.text
+
+
+def test_write_option_refuses_a_missing_value(configuration, tmp_path):
+    with pytest.raises(ValueError):
+        configuration.write_option(str(tmp_path / "f.json"),
+                                   "syslog.port")
+
+
+def test_write_option_removes_an_option(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"syslog": {"port": 514, "address": "/dev/log"}}\n')
+
+    configuration.write_option(str(path), "syslog.port", delete=True)
+
+    assert json.loads(path.read_text()) == {
+        "syslog": {"address": "/dev/log"}}
+
+
+def test_write_option_prunes_the_empty_sections(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"git": {"init_message": "msg"}}\n')
+
+    configuration.write_option(str(path), "git.init_message",
+                               delete=True)
+
+    assert json.loads(path.read_text()) == {}
+
+
+def test_write_option_removes_an_unknown_option(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"myscript": {"retries": 5, "token": "abc"}}\n')
+
+    configuration.write_option(str(path), "myscript.retries",
+                               delete=True)
+
+    assert json.loads(path.read_text()) == {"myscript": {"token": "abc"}}
+
+
+def test_write_option_refuses_to_remove_a_missing_option(configuration,
+                                                         tmp_path):
+    path = tmp_path / "99_config_set.json"
+    path.write_text('{"syslog": {"address": "/dev/log"}}\n')
+
+    with pytest.raises(ValueError):
+        configuration.write_option(str(path), "syslog.port",
+                                   delete=True)
+
+
+def test_write_option_refuses_to_remove_without_a_file(configuration,
+                                                       tmp_path):
+    with pytest.raises(ValueError):
+        configuration.write_option(str(tmp_path / "f.json"),
+                                   "syslog.port", delete=True)
+
+
+def test_write_option_refuses_a_broken_file(configuration, tmp_path):
+    path = tmp_path / "99_config_set.json"
+    path.write_text('not json at all')
+
+    with pytest.raises(ValueError):
+        configuration.write_option(str(path), "syslog.port", "514")
+
+
+def test_violations_record_a_dropped_option(configuration, tmp_path):
+    (tmp_path / "options.toml").write_text('[syslog]\n'
+                                           'port = "five"\n')
+
+    configuration.merge(str(tmp_path))
+
+    assert configuration._violations == [{
+        "kind": "type",
+        "file": str(tmp_path / "options.toml"),
+        "option": "syslog.port",
+        "dropped": True,
+        "message": "option 'syslog.port' must be of type integer, "
+                   "not str",
+    }]
+
+
+def test_violations_record_unknown_options_as_kept(configuration, tmp_path):
+    (tmp_path / "typo.toml").write_text('[versionchek]\n'
+                                        'enabled = true\n')
+
+    configuration.merge(str(tmp_path))
+
+    assert len(configuration._violations) == 1
+    assert configuration._violations[0]["kind"] == "unknown"
+    assert configuration._violations[0]["dropped"] is False
+
+
+def test_violations_record_a_broken_file(configuration, tmp_path):
+    (tmp_path / "broken.yaml").write_text("a: [unterminated\n")
+
+    configuration.merge(str(tmp_path))
+
+    assert configuration._violations[0]["kind"] == "parse"
+    assert configuration._violations[0]["dropped"] is True
+
+
+def test_violations_record_a_skipped_override(configuration, monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__SYSLOG__PORT", "five")
+
+    configuration.apply_env_overrides()
+
+    assert len(configuration._violations) == 1
+    violation = configuration._violations[0]
+    assert violation["kind"] == "override"
+    assert violation["file"] is None
+    assert violation["option"] == "DEBOPS_CONFIG__SYSLOG__PORT"
+    assert violation["dropped"] is True
+    assert "invalid literal" in violation["message"]
+
+
+def test_merge_records_the_configuration_layers(configuration):
+    data = {"syslog": {"address": "/dev/log"}}
+
+    configuration.merge(data, scope="project", origin="/project/a.yml")
+
+    assert configuration._layers == [
+        ("project", "/project/a.yml", {"syslog": {"address": "/dev/log"}}),
+    ]
+
+
+def test_recorded_layers_are_isolated_from_the_tree(configuration):
+    data = {"syslog": {"address": "/dev/log"}}
+
+    configuration.merge(data, scope="project", origin="/project/a.yml")
+    configuration.merge({"syslog": {"port": 514}}, scope="project",
+                        origin="/project/b.yml")
+
+    assert configuration._layers[0][2] == {"syslog": {"address":
+                                                      "/dev/log"}}
+
+
+def test_load_records_each_file_as_a_layer(configuration, tmp_path):
+    (tmp_path / "10-first.toml").write_text('[git]\ninit_message = "one"\n')
+    (tmp_path / "20-second.toml").write_text('[syslog]\naddress = "log"\n')
+
+    configuration.load(str(tmp_path), scope="project")
+
+    assert [layer[1] for layer in configuration._layers] == [
+        str(tmp_path / "10-first.toml"),
+        str(tmp_path / "20-second.toml"),
+    ]
+    assert [layer[0] for layer in configuration._layers] == ["project",
+                                                             "project"]
+
+
+def test_config_origins_attributes_the_last_layer(configuration):
+    configuration._config = {"syslog": {"port": 999}}
+    configuration._layers = [
+        ("defaults", "defaults.toml", {"syslog": {"port": 514}}),
+        ("project", "/project/a.yml", {"syslog": {"port": 999}}),
+    ]
+
+    origins = configuration.config_origins("syslog.port")
+
+    assert origins == [("syslog.port", "project", "/project/a.yml", 999)]
+
+
+def test_config_origins_split_within_a_section(configuration, tmp_path):
+    (tmp_path / "10-a.toml").write_text('[syslog]\nport = 514\n')
+    (tmp_path / "20-b.toml").write_text('[syslog]\naddress = "log"\n')
+
+    configuration.merge(str(tmp_path), scope="project")
+
+    origins = dict(
+        (path, (scope, origin))
+        for path, scope, origin, value in
+        configuration.config_origins("syslog"))
+
+    assert origins["syslog.port"] == ("project",
+                                      str(tmp_path / "10-a.toml"))
+    assert origins["syslog.address"] == ("project",
+                                         str(tmp_path / "20-b.toml"))
+
+
+def test_config_origins_fall_back_to_the_defaults(configuration):
+    configuration._config = {"syslog": {"port": 514}}
+    configuration._layers = [
+        ("defaults", "defaults.toml", {"syslog": {"port": 514}}),
+    ]
+
+    origins = configuration.config_origins("syslog.port")
+
+    assert origins == [("syslog.port", "defaults", "defaults.toml", 514)]
+
+
+def test_config_origins_name_the_override(configuration):
+    configuration._config = {"syslog": {"level": "DEBUG"}}
+    configuration._layers = [
+        ("defaults", "defaults.toml", {"syslog": {"level": "NOTICE"}}),
+        ("override", "DEBOPS_CONFIG__SYSLOG__LEVEL",
+         {"syslog": {"level": "DEBUG"}}),
+    ]
+
+    origins = configuration.config_origins("syslog.level")
+
+    assert origins == [("syslog.level", "override",
+                        "DEBOPS_CONFIG__SYSLOG__LEVEL", "DEBUG")]
+
+
+def test_config_origins_list_the_leaves_of_a_subtree(configuration):
+    configuration._config = {"views": {"system": {"debops":
+                                                  {"namespace": "debops"}}}}
+    configuration._layers = [
+        ("project", "/project/a.yml",
+         {"views": {"system": {"debops": {"namespace": "debops"}}}}),
+    ]
+
+    origins = configuration.config_origins("views.system")
+
+    assert origins == [("views.system.debops.namespace", "project",
+                        "/project/a.yml", "debops")]
+
+
+def test_config_origins_for_an_empty_section(configuration):
+    configuration._config = {"custom": {}}
+    configuration._layers = [("defaults", "defaults.toml", {"custom": {}})]
+
+    origins = configuration.config_origins("custom")
+
+    assert origins == [("custom", "defaults", "defaults.toml", {})]
+
+
+def test_config_origins_raise_for_a_missing_option(configuration):
+    with pytest.raises(OptionNotFoundError):
+        configuration.config_origins("nope")
+
+
+def test_config_get_show_origin_renders_the_columns(configuration):
+    configuration._config = {"syslog": {"level": "DEBUG"}}
+    configuration._layers = [
+        ("override", "DEBOPS_CONFIG__SYSLOG__LEVEL",
+         {"syslog": {"level": "DEBUG"}}),
+    ]
+
+    out = configuration.config_get("syslog.level", show_origin=True,
+                                   show_scope=True)
+
+    assert out == ("override\tDEBOPS_CONFIG__SYSLOG__LEVEL\t"
+                   "syslog.level=DEBUG")
+
+
+def test_config_get_show_origin_keeps_values_with_spaces(configuration):
+    """The option and its value are joined as the last column, so a
+    value with whitespace stays in one place when the lines are split
+    on whitespace."""
+    configuration._config = {"custom": {"greeting": "hello world"}}
+    configuration._layers = [
+        ("project", "/project/a.yml",
+         {"custom": {"greeting": "hello world"}}),
+    ]
+
+    out = configuration.config_get("custom.greeting", show_origin=True)
+
+    assert out == "/project/a.yml\tcustom.greeting=hello world"
+
+
+def test_config_get_renders_the_origin_values_in_the_unix_notation(
+        configuration):
+    configuration._config = {"custom": {"tools": ["ansible", "tofu"]}}
+    configuration._layers = [
+        ("project", "/project/custom.yml",
+         {"custom": {"tools": ["ansible", "tofu"]}}),
+    ]
+
+    out = configuration.config_get("custom.tools", show_origin=True)
+
+    assert out == "/project/custom.yml\tcustom.tools=ansible,tofu"
+
+
+def test_config_get_show_origin_refuses_other_formats(configuration):
+    with pytest.raises(ValueError):
+        configuration.config_get("syslog", format="json",
+                                 show_origin=True)
+
+
+def test_config_get_show_origin_wraps_the_home_path(configuration):
+    home = os.path.expanduser('~')
+    origin = os.path.join(home, '.config', 'debops', 'conf.d', 'a.yml')
+    configuration._config = {"git": {"init_message": "custom"}}
+    configuration._layers = [
+        ("user", origin, {"git": {"init_message": "custom"}})]
+
+    out = configuration.config_get("git.init_message", show_origin=True)
+
+    assert out == "~/.config/debops/conf.d/a.yml\tgit.init_message=custom"
+    # the ledger keeps the absolute path
+    assert configuration._layers[0][1] == origin
+
+
+def test_config_get_show_origin_keeps_non_home_origins(configuration):
+    configuration._config = {"syslog": {"port": 514, "level": "DEBUG"},
+                             "git": {"init_message": "x"}}
+    configuration._layers = [
+        ("system", "/etc/debops/conf.d/a.yml",
+         {"syslog": {"port": 514}}),
+        ("override", "DEBOPS_CONFIG__SYSLOG__LEVEL",
+         {"syslog": {"level": "DEBUG"}}),
+        ("runtime", "debops", {"git": {"init_message": "x"}}),
+    ]
+
+    out = configuration.config_get('.', show_origin=True)
+
+    assert "/etc/debops/conf.d/a.yml\tsyslog.port=514" in out
+    assert "DEBOPS_CONFIG__SYSLOG__LEVEL\tsyslog.level=DEBUG" in out
+    assert "debops\tgit.init_message=x" in out
+
+
+def test_detached_configuration_loads_the_given_paths(tmp_path):
+    (tmp_path / "system" / "conf.d").mkdir(parents=True)
+    (tmp_path / "user" / "conf.d").mkdir(parents=True)
+    (tmp_path / "system" / "conf.d" / "a.toml").write_text(
+        '[server]\nport = 8080\nhost = "one"\n')
+    (tmp_path / "user" / "conf.d" / "b.toml").write_text(
+        '[server]\nhost = "two"\n')
+
+    config = config_module.Configuration(
+        paths=[str(tmp_path / "system" / "conf.d"),
+               (str(tmp_path / "user" / "conf.d"), "user")])
+
+    assert config.raw["server"] == {"port": 8080, "host": "two"}
+    origins = dict(
+        (option, scope) for option, scope, origin, value in
+        config.config_origins("server"))
+
+    assert origins["server.host"] == "user"
+    assert origins["server.port"] == "system"
+
+
+def test_detached_configuration_renders_its_defaults(tmp_path,
+                                                     monkeypatch):
+    monkeypatch.setenv("DEBOPS_TEST_PORT", "9090")
+    defaults = tmp_path / "defaults.toml"
+    defaults.write_text("[server]\n"
+                        "port = {{ env['DEBOPS_TEST_PORT'] | d('8080') }}"
+                        "\n")
+
+    config = config_module.Configuration(defaults=str(defaults))
+
+    assert config.raw["server"]["port"] == 9090
+
+
+def test_detached_configuration_accepts_dictionary_defaults():
+    config = config_module.Configuration(
+        defaults={"server": {"port": 8080}})
+
+    assert config.raw["server"]["port"] == 8080
+    assert config.config_origins("server.port") == [
+        ("server.port", "defaults", "defaults", 8080)]
+
+
+def test_detached_configuration_validates_against_its_schema(tmp_path):
+    schema = tmp_path / "schema.json"
+    schema.write_text(json.dumps({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "server": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "port": {"type": "integer"}}}}}))
+    (tmp_path / "conf.d").mkdir()
+    (tmp_path / "conf.d" / "options.toml").write_text(
+        '[server]\nport = "five"\n')
+
+    config = config_module.Configuration(
+        paths=[str(tmp_path / "conf.d")], schema=str(schema))
+
+    assert "port" not in config.raw["server"]
+    assert config._violations[0]["kind"] == "type"
+
+
+def test_detached_configuration_without_schema_validates_nothing(
+        tmp_path, caplog):
+    (tmp_path / "conf.d").mkdir()
+    (tmp_path / "conf.d" / "options.yml").write_text("mine:\n  key: 1\n")
+
+    config = config_module.Configuration(paths=[str(tmp_path / "conf.d")])
+
+    assert config.raw["mine"] == {"key": 1}
+    assert not caplog.text
+
+
+def test_detached_unknown_options_have_no_debops_hint(tmp_path, caplog):
+    schema = tmp_path / "schema.json"
+    schema.write_text(json.dumps({
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"server": {"type": "object"}}}))
+    (tmp_path / "conf.d").mkdir()
+    (tmp_path / "conf.d" / "options.yml").write_text("other: 1\n")
+
+    config = config_module.Configuration(
+        paths=[str(tmp_path / "conf.d")], schema=str(schema))
+
+    assert "unknown option 'other'" in caplog.text
+    assert "custom" not in caplog.text
+
+
+def test_detached_configuration_applies_its_own_env_prefix(monkeypatch):
+    monkeypatch.setenv("MYSVC_CONFIG__SERVER__PORT", "8080")
+
+    config = config_module.Configuration(env_prefix="MYSVC_CONFIG__")
+
+    assert config.raw["server"]["port"] == 8080
+
+
+def test_detached_configuration_ignores_the_debops_overrides(monkeypatch):
+    monkeypatch.setenv("DEBOPS_CONFIG__SYSLOG__LEVEL", "DEBUG")
+
+    config = config_module.Configuration(env_prefix="MYSVC_CONFIG__")
+
+    assert "syslog" not in config.raw
+
+
+def test_detached_configuration_reads_its_env_files(tmp_path):
+    env_file = tmp_path / "environment"
+    env_file.write_text("MYSVC_TOKEN=secret\n")
+
+    config = config_module.Configuration(env_files=[str(env_file)])
+
+    assert config.get_env("MYSVC_TOKEN") == "secret"
+
+
+def test_config_set_coerces_a_string_value(configuration):
+    configuration.config_set("syslog.port", "514")
+
+    assert configuration.raw["syslog"]["port"] == 514
+
+
+def test_config_set_stores_python_values(configuration):
+    configuration.config_set("custom.myscript", {"retries": 5})
+
+    assert configuration.raw["custom"]["myscript"] == {"retries": 5}
+
+
+def test_config_set_checks_python_values_against_the_schema(configuration):
+    with pytest.raises(ValueError):
+        configuration.config_set("syslog.port", ["not", "an", "integer"])
+
+
+def test_config_set_refuses_an_unknown_option(configuration):
+    with pytest.raises(ValueError) as errmsg:
+        configuration.config_set("myscript.retries", 5)
+
+    assert "custom options belong" in str(errmsg.value)
+
+
+def test_config_set_records_its_layer(configuration):
+    configuration.config_set("syslog.port", 514)
+
+    scope, origin, data = configuration._layers[-1]
+
+    assert (scope, origin) == ("override", "config_set")
+
+
+def test_hcl_value_leaves_a_plain_string_alone():
+    assert config_module.hcl_value("dc1") is None
+
+
+def test_hcl_value_leaves_a_non_string_alone():
+    assert config_module.hcl_value(42) is None
+    assert config_module.hcl_value(None) is None
+    assert config_module.hcl_value(True) is None
+    assert config_module.hcl_value(["hcl:var.x"]) is None
+
+
+def test_hcl_value_strips_the_prefix_from_a_raw_expression():
+    assert config_module.hcl_value("hcl:var.image_name") == ("raw",
+                                                             "var.image_name")
+
+
+def test_hcl_value_keeps_the_prefix_in_an_escaped_literal():
+    """The second prefix of an escaped literal is part of the string
+    it carries: 'hcl:hcl:hello' means the literal 'hcl:hello'."""
+    assert config_module.hcl_value("hcl:hcl:hello") == ("literal",
+                                                        "hcl:hello")
+
+
+def test_hcl_value_refuses_an_empty_payload():
+    with pytest.raises(ValueError, match="empty HCL expression"):
+        config_module.hcl_value("hcl:")
+
+
+@pytest.mark.parametrize("extension", ["toml", "json", "yaml"])
+def test_load_keeps_the_hcl_prefix_through_the_formats(configuration,
+                                                       tmp_path,
+                                                       extension):
+    """A string value prefixed with 'hcl:' is a configuration value
+    like any other: the same value written in every format loads to
+    the same string, and the classifier reads the same kind from it."""
+    content = {
+        "toml": '[syslog]\naddress = "hcl:var.address"\n',
+        "json": '{"syslog": {"address": "hcl:var.address"}}\n',
+        "yaml": 'syslog:\n  address: "hcl:var.address"\n',
+    }[extension]
+    path = tmp_path / ("config." + extension)
+    path.write_text(content)
+
+    loaded = configuration.load(str(path))
+
+    assert loaded == {"syslog": {"address": "hcl:var.address"}}
+    assert config_module.hcl_value(
+        loaded["syslog"]["address"]) == ("raw", "var.address")
+
+
+def test_option_file_migration_announces_the_move(configuration, tmp_path,
+                                                  caplog):
+    """The legacy-file migration announces the move: the rendered
+    notice formats without a logging error -- a test of the file
+    effects alone cannot catch a format error, because logging
+    swallows it at emit time and the file effects still land."""
+    import logging
+    (tmp_path / "50_config_set.json").write_text("{}\n")
+
+    with caplog.at_level(logging.INFO):
+        path = configuration.option_file(str(tmp_path))
+
+    assert 'moved to' in caplog.text
+    assert 'override' in caplog.text
+
+
+def test_shadowing_file_scans_the_parents_later_subdirectories(
+        configuration, tmp_path):
+    """The subdirectories of the configuration directory which sort
+    after the override sublayer rank above the managed file: the
+    helper scans them, the same rule the loader applies."""
+    override = tmp_path / "override"
+    override.mkdir()
+    managed = override / "99_config_set.json"
+    managed.write_text('{"custom": {"greeting": "set"}}\n')
+    (tmp_path / "views-late").mkdir()
+    (tmp_path / "views-late" / "options.yml").write_text(
+        "custom:\n  greeting: shadowed\n")
+
+    shadow = config_module.shadowing_file(str(managed),
+                                          "custom.greeting")
+
+    assert shadow[1] == "shadowed"
+
+
+def test_shadowing_file_skips_the_non_configuration_candidates(
+        tmp_path):
+    """The scan skips the files which are not configuration files,
+    the ones which do not parse and the ones which do not parse into
+    a table: the shadow warning names only the real shadows."""
+    override = tmp_path / "override"
+    override.mkdir()
+    managed = override / "99_config_set.json"
+    managed.write_text('{"custom": {"greeting": "set"}}\n')
+    (override / "zz_notes.txt").write_text("custom: {greeting: x}\n")
+    (override / "zz_broken.json").write_text('{"custom": {\n')
+    (override / "zz_list.yaml").write_text("- just\n- a list\n")
+    (override / "zz_partial.toml").write_text(
+        '[custom]\nother = "value"\n')
+
+    assert config_module.shadowing_file(str(managed),
+                                        "custom.greeting") is None
+
+
+def test_shadowing_file_reads_the_json_candidates(tmp_path):
+    """The json candidates parse like the toml and yaml ones: a set
+    value is shadowed by a json file which defines the option."""
+    override = tmp_path / "override"
+    override.mkdir()
+    managed = override / "99_config_set.json"
+    managed.write_text('{"custom": {"greeting": "set"}}\n')
+    (override / "zz_options.json").write_text(
+        '{"custom": {"greeting": "shadowed"}}\n')
+
+    shadow = config_module.shadowing_file(str(managed),
+                                          "custom.greeting")
+
+    assert shadow == (str(override / "zz_options.json"), "shadowed")
+
+
+def test_shadowing_file_continues_past_a_prefix_only_file(tmp_path):
+    """A candidate which defines only the first segments of the path
+    does not end the scan: the shadow search continues, the shadow
+    the scan finds is the file which carries the option."""
+    override = tmp_path / "override"
+    override.mkdir()
+    managed = override / "99_config_set.json"
+    managed.write_text('{"custom": {"greeting": "set"}}\n')
+    (override / "aa_prefix.toml").write_text(
+        '[custom]\nother = "value"\n')
+    (override / "zz_full.toml").write_text(
+        '[custom]\ngreeting = "shadowed"\n')
+
+    shadow = config_module.shadowing_file(str(managed),
+                                          "custom.greeting")
+
+    assert shadow == (str(override / "zz_full.toml"), "shadowed")
+
+
+def test_apply_env_overrides_takes_the_first_type_of_a_typed_list(
+        configuration, monkeypatch):
+    """A schema which types an option with a type list pins the
+    first type: the environment value converts to it."""
+    monkeypatch.setenv("DEBOPS_CONFIG__PROJECT__TYPE", "server")
+
+    configuration.apply_env_overrides()
+
+    assert configuration.raw["project"]["type"] == "server"
+
+
+def test_apply_env_overrides_refuses_an_object_of_the_wrong_shape(
+        configuration, monkeypatch, caplog):
+    """An object option needs a JSON object: a plain string is
+    reported and skipped, the configuration keeps its default."""
+    monkeypatch.setenv("DEBOPS_CONFIG__TOFU__MKVIEW__DEFAULT_MODULES",
+                       "registry")
+
+    with caplog.at_level(logging.WARNING):
+        configuration.apply_env_overrides()
+
+    assert 'must be a JSON object' in caplog.text
+    # the refused override recorded no layer
+    assert configuration._env_overrides == []
+
+
+def test_coerce_override_reaches_the_types_the_schema_does_not_name(
+        configuration, monkeypatch):
+    """The coercion branches the packaged schema cannot reach -- the
+    number option, the typeless node, the list and object values --
+    behave like their documented conversions."""
+    resolver = mock.Mock(return_value={"type": "number"})
+    monkeypatch.setattr(config_module, "_resolve_schema_node", resolver)
+
+    assert configuration._coerce_override(["x"], "2") == 2
+    assert configuration._coerce_override(["x"], "1.5") == 1.5
+
+    resolver.return_value = {}
+    assert configuration._coerce_override(["x"], "a,b") == ["a", "b"]
+    assert configuration._coerce_override(["x"], '[1, "two"]') == [1, "two"]
+
+    resolver.return_value = {"type": "object"}
+    with pytest.raises(ValueError, match='JSON object'):
+        configuration._coerce_override(["x"], "registry")
+
+
+def test_coerce_scalar_refuses_the_values_the_type_cannot_hold(
+        configuration):
+    """The '--type' coercion refuses instead of guessing: an integer
+    which is not one, a boolean which is neither, an object which is
+    not a JSON object -- and an unknown option raises the unknown
+    message."""
+    int_node = configuration._option_schema_node(["syslog", "port"])
+    with pytest.raises(config_module.OptionRefused, match='not an integer'):
+        configuration._coerce_scalar(["syslog", "port"], "five", "int",
+                                     int_node)
+
+    bool_node = configuration._option_schema_node(
+        ["version_check", "enabled"])
+    with pytest.raises(config_module.OptionRefused, match='not a boolean'):
+        configuration._coerce_scalar(["version_check", "enabled"], "maybe",
+                                     "bool", bool_node)
+
+    with pytest.raises(config_module.OptionRefused, match='JSON object'):
+        configuration._coerce_scalar(["x"], "registry", "dict",
+                                     {"type": "object"})
+
+    with pytest.raises(ValueError,
+                       match='custom options belong under'):
+        configuration._coerce_scalar(["no", "such", "option"], "value",
+                                     None, None)
+
+
+def test_coerce_element_follows_the_items_type(configuration):
+    """The elements of a list option convert by the schema's items
+    type: booleans, integers, numbers, strings -- and the values of
+    an untyped list parse as their JSON look-alikes."""
+    assert configuration._coerce_element("true", None,
+                                         {"type": "array",
+                                          "items": {"type": "boolean"}}) \
+        is True
+    assert configuration._coerce_element("5", None,
+                                         {"type": "array",
+                                          "items": {"type": "integer"}}) \
+        == 5
+    assert configuration._coerce_element("1.5", None,
+                                         {"type": "array",
+                                          "items": {"type": "number"}}) \
+        == 1.5
+    assert configuration._coerce_element("2", None,
+                                         {"type": "array",
+                                          "items": {"type": "number"}}) \
+        == 2
+    assert configuration._coerce_element("plain", None,
+                                         {"type": "array",
+                                          "items": {"type": "string"}}) \
+        == "plain"
+    assert configuration._coerce_element("3", None, None) == 3
+
+
+def test_load_defaults_reads_the_json_and_yaml_formats(configuration,
+                                                       tmp_path):
+    """The defaults load from the toml, json and yaml files; an
+    unsupported extension refuses the load."""
+    import json as json_module
+    json_defaults = tmp_path / "defaults.json"
+    json_defaults.write_text('{"custom": {"from": "json"}}\n')
+    configuration._load_defaults(str(json_defaults))
+    assert configuration.raw["custom"]["from"] == "json"
+
+    yaml_defaults = tmp_path / "defaults.yaml"
+    yaml_defaults.write_text("custom:\n  from: yaml\n")
+    configuration._load_defaults(str(yaml_defaults))
+    assert configuration.raw["custom"]["from"] == "yaml"
+
+    defaults = tmp_path / "defaults.ini"
+    defaults.write_text("custom:\n")
+    with pytest.raises(ValueError, match='Unsupported defaults'):
+        configuration._load_defaults(str(defaults))
+
+
+def test_the_report_names_the_file_of_a_root_level_violation(
+        configuration, caplog):
+    """A schema violation which names no option -- the document
+    root itself, which the merge guard catches before the schema in
+    the real files -- reports against the file."""
+    from jsonschema import ValidationError
+    error = ValidationError('the document root is not a table')
+    error.validator = 'type'
+
+    with caplog.at_level(logging.WARNING):
+        configuration._report_violation('options.yaml', {}, error)
+
+    assert 'the document root is not a table' in caplog.text
+    assert 'options.yaml' in caplog.text

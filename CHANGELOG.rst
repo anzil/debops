@@ -23,8 +23,228 @@ You can read information about required changes between releases in the
 
 .. _debops master: https://github.com/debops/debops/compare/v3.4.0...master
 
+Added
+~~~~~
+
+New DebOps roles
+''''''''''''''''
+
+- The :ref:`debops.cloudflared` role can be used to install the Cloudflare
+  Tunnel client from the upstream APT repository and manage one or more
+  tunnels through a systemd template unit. Tunnels can be managed remotely
+  from the Cloudflare dashboard with a token, or locally with ingress rules
+  defined in the Ansible inventory, using credentials stored by the
+  :ref:`debops.secret` role.
+
+- The :ref:`debops.garage` role installs the `Garage`__ S3-compatible
+  object store. A single-node inventory produces a working S3 endpoint in
+  one play via the daemon's ``--single-node`` bootstrap, with TLS
+  terminated on :ref:`debops.nginx`. Binary upgrades are gated, so that
+  a change of the pinned version cannot silently become a major upgrade.
+
+  .. __: https://garagehq.deuxfleurs.fr/
+
+- The :ref:`debops.vmagent` role can be used to install the VictoriaMetrics
+  :command:`vmagent` metrics agent from the upstream release archive, verified
+  with a SHA256 checksum, and manage one or more instances through a systemd
+  template unit. Scrape jobs can be defined on different inventory levels and
+  by other roles, and the bearer tokens used for remote write are stored by
+  the :ref:`debops.secret` role.
+
+- The :ref:`debops.prometheus_exporter` role installs Prometheus exporters
+  from the Debian packages (the ``prometheus-*-exporter`` family) and
+  configures each of them with a systemd drop-in which replaces the command
+  line, so that the role does not depend on the differences between the
+  packages and the Debian releases. The exporters listen on loopback, to be
+  scraped by :ref:`debops.vmagent`, and can be opened in the firewall for
+  a list of addresses.
+
+General
+'''''''
+
+- Journal records emitted by the :command:`debops` command now carry
+  a ``[project:view]`` prefix which names the project directory and
+  the infrastructure view of the operation, so entries from
+  different projects can be told apart in the system journal.
+
+- Configuration files are now validated when they are loaded.
+  Options not defined by DebOps are reported as warnings and kept.
+  Options with a value of a wrong type are reported and ignored, so
+  a mistake cannot silently change the effective configuration.
+
+- The new 'custom' section of the configuration tree is reserved for
+  options defined outside of DebOps: scripts and integrations can
+  store their parameters there, read them with :command:`debops
+  config get` and override them from the environment. DebOps does
+  not use it and will not define options in it.
+
+- The new :command:`debops config set` command sets or removes
+  configuration options in the configuration files, in a project
+  directory or in the user configuration with ``--user``. The
+  values are converted to the type of the option. The managed file
+  lives in the ``override/`` subdirectory of the configuration
+  directory, which ranks above the directory's own files: the set
+  options win over the hand-written ones. The
+  ``config.override_filename`` option places the file, and the
+  legacy top-level files migrate into it. A file of the
+  subdirectory which sorts after the managed one and defines the
+  option still wins -- the command warns and names it.
+
+- The new :command:`debops config check` command checks the
+  configuration for errors and exits with a non-zero status when an
+  option was dropped or a file could not be parsed, which makes it
+  usable in CI pipelines. The ``--strict`` option also fails the
+  check on unknown options.
+
+- The new :command:`debops tofu` section manages OpenTofu
+  infrastructure in the project views. See :ref:`the OpenTofu
+  integration <debops_tofu>` in the manual for the model, the
+  operations and the recipes.
+
+- The :command:`debops project init` command gains the ``--tofu``
+  option which creates the OpenTofu view of the default view at the
+  initialization, keyed by the ``--encrypt`` decision (which gains
+  the ``plain`` choice), and the ``--pre-commit`` option which
+  installs the project's pre-commit hook.
+
+- The ``debops.core.config.Configuration`` class can now build a
+  standalone configuration from caller-provided sources: defaults,
+  configuration files and directories, a JSON Schema, an
+  environment override prefix and environment files. The new
+  ``config_set()`` method sets an option in the tree with the type
+  conversion the command line uses. Without arguments, the class
+  builds the DebOps configuration as before.
+
+- The :command:`debops config get` command gained new ways to read
+  the configuration: options can be printed from the root of the
+  configuration tree, with the layer and the source which last set
+  each of them. Run :command:`debops config --help` for the new
+  options.
+
+- Configuration options can now be overridden from the environment
+  with ``DEBOPS_CONFIG__SECTION__KEY`` variables, for example
+  ``DEBOPS_CONFIG__SYSLOG__LEVEL=DEBUG``. The values are converted
+  to the type of the option, the overrides rank above all
+  configuration files, and :command:`debops config list` shows
+  which overrides are in effect.
+
+- The :command:`debops` command now loads a '.env' file from the
+  root of the infrastructure view, 'ansible/views/<view>/.env', on
+  top of the project directory environment. The file is ignored by
+  git and holds variables specific to one view.
+
+- The SSH host keys of the inventory hosts can be stored per
+  infrastructure view in a known_hosts file inside the project
+  directory, selected by the ``views.<view>.ssh.known_hosts``
+  configuration option and used by the DebOps commands and the
+  Ansible runs of the view alike. The store files are tracked in
+  the git repository of the project.
+
+- The :command:`debops run`, :command:`debops check` and
+  :command:`debops exec` commands accept unseen SSH host keys on
+  the first contact with a host when run with the ``--accept``
+  option. The acceptance is announced before the run and the keys
+  the store gained are reported afterwards.
+
+- The new :command:`debops ssh`, :command:`debops scp` and
+  :command:`debops sftp` commands connect to and transfer files
+  from hosts defined in the Ansible inventory of the project, with
+  the SSH connection options composed from the inventory
+  variables.
+
+- The new :command:`debops ssh rescan` command refreshes the
+  known_hosts entries of the inventory hosts. It scans the current
+  host keys, verifies them against the SSHFP records of the DNS
+  when the zone publishes them, and rewrites only the entries of
+  the hosts whose keys changed. The defaults of the verification
+  and the prompting are configurable.
+
+- The new ``config.default_output`` option names the output format
+  which :command:`debops config get` renders with when the
+  ``--format`` option is not given; it accepts ``unix``, ``yaml``,
+  ``json`` and ``toml``, and ``yaml`` is the default.
+
+:ref:`debops.unattended_upgrades` role
+''''''''''''''''''''''''''''''''''''''
+
+- The new :file:`scope/unattended_upgrades/run` scoped playbook can be used to
+  perform unattended upgrades on hosts in the Ansible inventory, using the
+  ``unattended-upgrades`` APT configuration.
+
+:ref:`debops.zabbix_agent` role
+'''''''''''''''''''''''''''''''
+
+- The connection encryption mode can now be selected: a pre-shared key
+  (the previous behaviour), an X.509 certificate from a PKI realm managed
+  by the :ref:`debops.pki` role, or unencrypted connections. In the
+  certificate mode the role installs a PKI hook which restarts the agent
+  when its certificate is renewed.
+
+- The role can register the host in Zabbix through the JSON-RPC API, with
+  host groups, templates, macros, tags and encryption settings defined in
+  the Ansible inventory. Objects added to the host in Zabbix by other means
+  are preserved. List entries in the ``absent`` state remove the host from
+  a host group, unlink a template, or remove a macro or a tag. On hosts
+  without IPv4 the host interface uses the default IPv6 address.
+
 Changed
 ~~~~~~~
+
+General
+'''''''
+
+- View names of DebOps projects no longer accept dashes or other
+  characters outside of the letters, the digits and the underscores.
+  The names are validated when the views are created, by
+  :command:`debops project init --default-view` and
+  :command:`debops project mkview`; the views which already exist
+  keep working.
+
+- Drop support for the end-of-life Python releases 3.8, 3.9 and 3.10;
+  Python 3.11 or newer is required to run the :command:`debops`
+  command and its development environment.
+
+- The :command:`debops` command line no longer prints informational
+  messages on the terminal by default: the terminal stays quiet
+  unless something needs attention or the verbosity is increased.
+  Important events — hook executions, interrupted commands, version
+  update notices and command failures — are recorded in the system
+  journal, which can be made more verbose than the terminal through
+  the ``[syslog] level`` configuration option.
+
+- Files that DebOps generates in a project directory can no longer
+  be written outside of it: a write whose target resolves outside
+  of the project directory is refused with an error, so a mistyped
+  path cannot scatter generated files across the file system.
+
+- A failing pre-refresh hook aborts the :command:`debops project
+  refresh` command with an error exit code instead of exiting
+  successfully, matching the behavior of the other hook types.
+
+- The DebOps Python modules moved into subpackages: the library into
+  ``debops.core``, the command line into ``debops.cli``. The library
+  leaves the process environment and the working directory alone and
+  returns data instead of printing it. Scripts importing the internal
+  ``debops.*`` modules directly need to import from ``debops.core.*``
+  or ``debops.cli.*`` now.
+
+- Status messages of the :command:`debops` command are written to the
+  standard error stream and the system journal, and remain visible on
+  the terminal; the standard output stays reserved for
+  machine-readable output.
+
+- Relative playbook names on the command line resolve against the
+  project directory instead of the working directory the command was
+  invoked from.
+
+- An undefined configuration option requested with :command:`debops
+  config get` is reported on the standard error stream; the exit code
+  and the JSON output are unchanged.
+
+- The Ansible Collection's lookup plugins read the DebOps
+  configuration from ``debops.core`` and fall back to the previous
+  module layout when an older ``debops`` Python package provides
+  them.
 
 :ref:`debops.sshd` role
 '''''''''''''''''''''''
@@ -39,6 +259,41 @@ Changed
   configuration can be enabled selectively through Ansible inventory when
   needed.
 
+:ref:`debops.global_handlers` role
+''''''''''''''''''''''''''''''''''
+
+- Handlers specific to a single role have been moved from the
+  :ref:`debops.global_handlers` role back to their own roles, where they can
+  use the role's default variables. The roles that notified handlers of other
+  roles now either run the role that owns them in their playbooks, or define
+  their own copies of the affected handlers. The handlers that remain in the
+  :ref:`debops.global_handlers` role are the Ansible local fact refreshes, the
+  :program:`systemd` service manager reloads, and the ``xinetd`` handlers
+  which don't have a corresponding DebOps role.
+
+- DebOps roles no longer import the :ref:`debops.global_handlers` role
+  themselves. Instead, DebOps playbooks include the role as the first role of
+  each play (or import it as the first task in task-driven plays), so that the
+  shared handlers are defined before the handlers of any other role in the
+  play. This removes tens of thousands of static Ansible imports from playbook
+  parsing and significantly reduces playbook startup time and memory usage.
+
+- Custom Ansible playbooks that use DebOps roles directly need to include the
+  :ref:`debops.global_handlers` role in the play that runs the roles, see the
+  :ref:`debops.global_handlers` role documentation. Plays that notify the
+  shared handlers without the role will fail at runtime with a missing handler
+  error.
+
+- The :command:`debops config get` output changes: the ``unix``
+  format prints one option per line in the dotted ``path=value``
+  notation, the same notation the environment overrides use, with the
+  list values comma-separated, and the ``--show-origin`` table renders
+  its values the same way. The default format moves to the
+  ``config.default_output`` option: the tree and section dumps render
+  as before, the scalar and boolean queries drop the document-end
+  marker which PyYAML appends, and the list queries render in the YAML
+  list form.
+
 Fixed
 ~~~~~
 
@@ -48,6 +303,84 @@ General
 - The version update notice printed by the :command:`debops` command is now
   visible on the standard error stream when the check runs at the default
   log level.
+
+- :command:`debops project init` checks the GPG recipients of an
+  encrypted project before creating the directory and refuses keys
+  which cannot encrypt; a git-crypt failure during initialization
+  aborts the command instead of finishing silently.
+
+- A configuration file whose content does not match its extension,
+  for example a TOML document saved as '.json', crashed the
+  :command:`debops` command with a traceback. The file is now
+  reported as unparsable and skipped.
+
+- A configuration path which descends into an option which is not a
+  section, for example 'project.view.ansible', crashed the
+  :command:`debops config get` command with a traceback. Such paths
+  are now reported as undefined options.
+
+- Every configuration file was loaded and validated twice per
+  :command:`debops` invocation, reporting each problem twice.
+
+- :command:`debops project init` with a custom infrastructure view
+  selected by the ``-V`` option now installs the Ansible Collections
+  into the project directory. The Collections were previously
+  installed in ``~/.ansible/collections``, because the installation
+  command could not see the Ansible configuration of a view which did
+  not exist yet, and projects with a Python virtual environment do
+  not search the account-wide Collection path, which broke playbook
+  lookup on a fresh install.
+
+- :command:`debops project mkview` with the ``--encrypt`` and
+  ``--keys`` options now applies them. The EncFS volume of the new
+  view is created, and the '.gitattributes' file of a git-crypt view
+  declares the filter as active. The options were previously accepted
+  and silently dropped, and the secrets of the new view were stored
+  in the repository as plaintext. On a repository without git-crypt
+  setup the command now refuses with an error, because creating a
+  view cannot retrofit repository-wide encryption.
+
+- The automatic commit of the :command:`debops` runner commands and
+  of :command:`debops project unlock` refuses to run while the
+  git-crypt repository is locked and the working tree has changes on
+  the encrypted paths. Such a commit stores the secret files as
+  plaintext in the repository history, and the next unlock renders
+  them as empty files. The command now stops with an error before
+  anything runs; changes outside the encrypted paths still commit
+  automatically.
+
+- :command:`debops project init --encrypt encfs` creates the EncFS
+  volume of a legacy project directory again. The volume creation was
+  lost in the refactoring of the secret store, and legacy projects
+  reported a successful creation while their secrets stayed
+  unencrypted.
+
+- The ``debops.debops.to_toml`` filter plugin failed with a ``RecursionError``
+  with :command:`ansible-core` v2.18 and older when the configuration
+  contained values from host facts or lookups, for example in the
+  :ref:`debops.telegraf` role. Such "unsafe" strings are now converted to
+  plain strings before serialization.
+
+:ref:`debops.nginx` role
+''''''''''''''''''''''''
+
+- The role no longer fails with ansible-core 2.19 and later when the
+  ``nginx_default_name`` and ``nginx_default_ssl_name`` variables keep their
+  default empty values. The default server selection checked the strings
+  directly in conditions, which have to evaluate to a boolean now.
+
+- The proxy server template no longer passes custom ``proxy_headers`` text
+  through the ``bool`` filter, which ansible-core 2.19 and later report as
+  an invalid boolean value.
+
+Removed
+~~~~~~~
+
+General
+'''''''
+
+- The unused ``debops.config.Configuration.section()`` method was removed
+  from the Python API. It had no callers in the project.
 
 
 `debops v3.4.0`_ - 2026-11-05

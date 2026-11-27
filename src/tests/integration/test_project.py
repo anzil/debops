@@ -95,6 +95,67 @@ def test_init_installs_collections_with_a_stub_galaxy(run_debops, tmp_path,
     assert "ansible/collections/requirements.yml" in invocation
 
 
+def test_init_venv_installs_collections_in_the_project_directory(
+        run_debops, tmp_path, debops_env):
+    """Collections land in the project directory with a custom view.
+
+    Regression test: 'debops project init -t modern --venv -V <view>'
+    resolves the infrastructure view before the project exists, so the
+    Ansible configuration recorded in the environment refers to the
+    fallback view and does not exist at installation time. The
+    Collections must be installed with an explicit path pointing into
+    the project directory instead of relying on that configuration.
+    """
+    log = tmp_path / "commands.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    # A stub Python interpreter which pretends to create the virtual
+    # environment -- including the interpreter and 'ansible-galaxy'
+    # binaries which the project configuration expects inside it -- and
+    # pretends to install the Python packages. This keeps the test
+    # hermetic: no Python packages are downloaded or installed.
+    stub_python = bin_dir / "python3"
+    stub_python.write_text(
+        '#!/bin/sh\n'
+        'echo "$PWD" "$@" >> "{log}"\n'
+        'case "$*" in *"-m venv"*)\n'
+        '    for venv_path; do :; done\n'
+        '    mkdir -p "$venv_path/bin"\n'
+        '    printf \'#!/bin/sh\\necho "$PWD" "$@" >> "{log}"\\n\''
+        ' > "$venv_path/bin/python"\n'
+        '    printf \'#!/bin/sh\\necho "$PWD" "$@" >> "{log}"\\n'
+        'echo "ANSIBLE_CONFIG=$ANSIBLE_CONFIG" >> "{log}"\\n'
+        'case "$*" in *"collection list"*) echo "{{}}" ;; esac\\n'
+        'exit 0\\n\' > "$venv_path/bin/ansible-galaxy"\n'
+        '    chmod 0755 "$venv_path/bin/python" '
+        '"$venv_path/bin/ansible-galaxy"\n'
+        '    ;;\n'
+        'esac\n'
+        'exit 0\n'.format(log=log))
+    stub_python.chmod(0o755)
+
+    env = dict(debops_env,
+               PATH=os.pathsep.join([str(bin_dir), os.environ["PATH"]]))
+    project_dir = tmp_path / "example"
+
+    result = run_debops("project", "init", "-t", "modern", "--venv",
+                        "-V", "webservers", str(project_dir), env=env)
+
+    assert result.returncode == 0
+    invocation = log.read_text()
+    assert "collection install -r" in invocation
+    assert ("-p " + str(project_dir / "ansible" / "collections")
+            in invocation)
+
+    # The environment of the installation command refers to the
+    # Ansible configuration of the view which was created, not to the
+    # fallback view resolved before the project existed
+    assert ("ANSIBLE_CONFIG="
+            + str(project_dir / "ansible" / "views" / "webservers"
+                  / "ansible.cfg") in invocation)
+
+
 def test_init_reports_a_missing_galaxy_binary(run_debops, tmp_path,
                                               debops_env):
     bin_dir = tmp_path / "bin"
@@ -103,7 +164,7 @@ def test_init_reports_a_missing_galaxy_binary(run_debops, tmp_path,
     env = dict(debops_env, PATH=str(bin_dir))
     project_dir = tmp_path / "example"
 
-    result = run_debops("project", "init", "-v", str(project_dir), env=env)
+    result = run_debops("project", "init", "-vv", str(project_dir), env=env)
 
     assert result.returncode == 0
     assert "ansible-galaxy not available in $PATH" in error_message(result)
@@ -184,7 +245,7 @@ def test_refresh_updates_the_project(run_debops, tmp_path, debops_env):
                         env=debops_env)
 
     assert result.returncode == 0
-    assert "Refreshed DebOps project" in result.stdout
+    assert "Refreshed DebOps project" in error_message(result)
 
 
 def test_init_with_template_reports_created_paths(run_debops, tmp_path,
@@ -199,7 +260,7 @@ def test_init_with_template_reports_created_paths(run_debops, tmp_path,
     output = error_message(result)
     assert "Created hosts" in output
     assert "Created group_vars/webservers" in output
-    assert "Applied the inventory specification." in result.stdout
+    assert "Applied the inventory specification." in output
     hosts = (project_dir / "ansible" / "views" / "system" / "inventory"
              / "hosts")
     assert "[webservers]" in hosts.read_text()
@@ -221,7 +282,7 @@ def test_refresh_with_template_reports_skipped_paths(run_debops, tmp_path,
     assert result.returncode == 0
     assert "Skipped existing hosts" in error_message(result)
     assert ("Use '--force' to overwrite or remove paths which already exist."
-            in result.stdout)
+            in error_message(result))
     assert hosts.read_text() == before
 
 
@@ -246,7 +307,7 @@ def test_refresh_dry_run_reports_planned_paths(run_debops, tmp_path,
     assert "Would create group_vars/dryrun" in output
     assert "Would create hosts_dryrun" in output
     assert "Inventory specification will not be written to disk" in output
-    assert "Applied the inventory specification." not in result.stdout
+    assert "Applied the inventory specification." not in output
     inventory = (project_dir / "ansible" / "views" / "system" / "inventory")
     assert not (inventory / "group_vars" / "dryrun").exists()
     assert not (inventory / "hosts_dryrun").exists()
@@ -267,7 +328,7 @@ def test_refresh_force_reports_removals_and_kept_paths(run_debops, tmp_path,
     assert "Removed group_vars/all/sshd.yml" in output
     assert "Created host_vars" in output
     assert "Kept group_vars/all/keyring.yml" in output
-    assert "Applied the inventory specification." in result.stdout
+    assert "Applied the inventory specification." in output
 
 
 def test_refresh_dry_run_reports_planned_removals(run_debops, tmp_path,
@@ -385,7 +446,7 @@ def test_refresh_aborts_on_a_failing_pre_refresh_hook(run_debops, tmp_path,
     result = run_debops("project", "refresh", str(project_dir),
                         env=debops_env)
 
-    assert result.returncode == 0
+    assert result.returncode == 1
     assert "Hook pre-refresh aborted" in error_message(result)
     assert hosts.read_text() == before
 
@@ -480,7 +541,7 @@ def test_venv_enable_activates_an_existing_project(run_debops, tmp_path,
                         env=debops_env)
 
     assert result.returncode == 0
-    assert "debops project venv install" in result.stdout
+    assert "debops project venv install" in error_message(result)
     assert (project_dir / ".debops" / "conf.d" / "venv.yml").exists()
     assert (project_dir / ".debops" / "requirements.txt").exists()
     assert not (project_dir / ".debops" / "venv").exists()
@@ -524,7 +585,7 @@ def test_venv_enable_activates_an_existing_project(run_debops, tmp_path,
     result = run_debops("project", "venv", "enable", str(project_dir),
                         env=debops_env)
     assert result.returncode == 0
-    assert "already enabled" in result.stdout
+    assert "already enabled" in error_message(result)
 
 
 @network
@@ -819,3 +880,29 @@ def test_project_commit_creates_a_commit(run_debops, tmp_path, debops_env):
                              "--porcelain"], capture_output=True, text=True,
                             check=True)
     assert status.stdout == ""
+
+
+def test_commit_refuses_a_foreign_git_repository(run_debops, tmp_path,
+                                                 debops_env):
+    """A git repository which is not a DebOps project directory is left
+    alone: the auto-commit must not touch repositories DebOps does not
+    own, like /etc managed by etckeeper."""
+    subprocess.run(["git", "init", "-q"], cwd=str(tmp_path), check=True)
+    tracked = tmp_path / "tracked"
+    tracked.write_text("initial\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked"],
+                   env=debops_env, check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-q",
+                    "-m", "initial"], env=debops_env, check=True)
+    tracked.write_text("changed\n")
+
+    result = run_debops("project", "commit", cwd=str(tmp_path),
+                        env=debops_env)
+
+    assert result.returncode == 1
+    assert "project directory not found" in error_message(result)
+    head = subprocess.run(["git", "-C", str(tmp_path), "rev-list",
+                           "--count", "HEAD"], capture_output=True,
+                          text=True, check=True)
+    assert head.stdout.strip() == "1"
+    assert tracked.read_text() == "changed\n"

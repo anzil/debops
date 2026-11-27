@@ -67,6 +67,8 @@ computer, using Docker or Vagrant. Alternatively, a set of scripts can be
 installed on your own computer, that will let you manage multiple, separate IT
 infrastructure environments.
 
+`Documentation for older releases <https://debops.readthedocs.io/>`__
+
 .. toctree::
    :caption: Introduction
    :maxdepth: 1
@@ -86,6 +88,7 @@ infrastructure environments.
 
    user-guide/debops-for-ansible
    user-guide/project-directories
+   user-guide/configuration
    user-guide/scripts/index
    user-guide/hooks
    user-guide/global-variables
@@ -94,6 +97,7 @@ infrastructure environments.
    user-guide/universal-configuration
    user-guide/inventory-spec
    user-guide/dns-configuration
+   user-guide/ssh-suite
    ansible/role-index
    ansible/roles/index
 
@@ -102,9 +106,23 @@ infrastructure environments.
    :maxdepth: 2
    :hidden:
 
+   admin-guide/configuration-recipes
    admin-guide/linux-containers
    admin-guide/service-ports
    admin-guide/local-apt-repository
+
+.. toctree::
+   :caption: OpenTofu Guide
+   :maxdepth: 2
+   :hidden:
+
+   opentofu-guide/index
+   opentofu-guide/inventory-bridge
+   opentofu-guide/remote-state
+   opentofu-guide/registry-modules
+   opentofu-guide/state-adoption
+   opentofu-guide/ci
+   opentofu-guide/incus
 
 .. toctree::
    :caption: Developer Guide
@@ -116,6 +134,7 @@ infrastructure environments.
    developer-guide/contributing-docs
    developer-guide/testing
    developer-guide/gh-ci-pipeline
+   developer-guide/configuration-options
    developer-guide/development-model
    dep/index
 

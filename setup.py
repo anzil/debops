@@ -102,8 +102,9 @@ else:
     print('Warning: manual pages not built')
 
 setup(
-    install_requires=['distro', 'future', 'jinja2', 'packaging', 'pyyaml',
-                      'pyxdg', 'toml', 'python-dotenv', 'gitpython'],
+    install_requires=['distro', 'dnspython', 'future', 'jinja2',
+                      'jsonschema', 'packaging', 'pyyaml', 'pyxdg', 'toml',
+                      'python-dotenv', 'gitpython'],
     extras_require={
         'ansible': ['ansible', 'netaddr', 'passlib',
                     'python-ldap', 'dnspython', 'pyopenssl'],
@@ -142,7 +143,7 @@ setup(
     license="GPL-3.0-or-later",
     license_files=glob.glob("LICENSES/*.txt"),
     keywords="ansible debian sysadmin",
-    python_requires='>=3.8,<4',
+    python_requires='>=3.11,<4',
     download_url='https://github.com/debops/debops'
                  '/archive/v' + unicode(RELEASE) + '.tar.gz',
     classifiers=[
@@ -156,9 +157,6 @@ setup(
                 'Operating System :: POSIX',
                 'Programming Language :: Other Scripting Engines',
                 'Programming Language :: Python',
-                'Programming Language :: Python :: 3.8',
-                'Programming Language :: Python :: 3.9',
-                'Programming Language :: Python :: 3.10',
                 'Programming Language :: Python :: 3.11',
                 'Programming Language :: Python :: 3.12',
                 'Programming Language :: Python :: 3.13',
